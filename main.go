@@ -39,6 +39,10 @@ func main() {
 	torConf := &tor.StartConf{
 		DataDir: torDataDir(*listenFlag),
 		ExePath: `C:\Users\matti\Desktop\Tor Browser\Browser\TorBrowser\Tor\tor.exe`,
+		ExtraArgs: []string{
+			"--quiet",
+			"--Log", "notice file " + torDataDir(*listenFlag) + "/tor.log",
+		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
