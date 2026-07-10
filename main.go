@@ -4,46 +4,40 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"encoding/base32"
+	"flag"
 	"fmt"
+	"io"
+	"net"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/cretz/bine/tor"
 )
 
 func main() {
+	// Parse command line flags
+	listenFlag := flag.Bool("listen", false, "Listen for incoming connections")
+	connectFlag := flag.String("connect", "", "Connect to a peer's onion address")
+	flag.Parse()
+
 	printBanner()
 
-	// --- Step 1: Generate Ed25519 keypair ---
+	if !*listenFlag && *connectFlag == "" {
+		fmt.Println("  [VEIL] Please specify --listen or --connect <address>")
+		os.Exit(1)
+	}
+
+	// Step 1: Generate Identity (We need this for both connecting and listening eventually)
 	fmt.Println("  [VEIL] generating identity keypair...")
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		fatal("failed to generate keypair", err)
 	}
 
-	// Preview address (pre-Tor) — 52-char base32 of pubkey
-	encoded := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(publicKey)
-	previewAddr := strings.ToLower(encoded) + ".onion"
-	fmt.Printf("  [VEIL] keypair ready. preview address: %s\n", previewAddr)
-	fmt.Println()
-
-	// --- Step 2: Start embedded Tor daemon ---
-	fmt.Println("  [VEIL] starting tor daemon...")
-	fmt.Println("  [VEIL] this may take 30–60 seconds on first run...")
-	fmt.Println()
-
-	// tor.Start() looks for 'tor' in PATH. It will:
-	// 1. Spin up a tor process
-	// 2. Wait until it bootstraps (connects to the Tor network)
-	// 3. Return a handle we use to create onion services and make connections
+	// Step 2: Start Tor Daemon
+	fmt.Println("  [VEIL] starting tor daemon (may take 30-60s)...")
 	torConf := &tor.StartConf{
-		// DataDir is where Tor stores its state, cached descriptors, etc.
-		// We use a hidden folder in the user's home directory.
-		DataDir: torDataDir(),
-		// TorrcFile and ExePath: point directly at the tor.exe from Tor Browser.
-		// Once we ship Veil, this will be replaced by an embedded binary.
+		DataDir: torDataDir(*listenFlag),
 		ExePath: `C:\Users\matti\Desktop\Tor Browser\Browser\TorBrowser\Tor\tor.exe`,
 	}
 
@@ -52,64 +46,112 @@ func main() {
 
 	t, err := tor.Start(ctx, torConf)
 	if err != nil {
-		fatal("failed to start tor — is tor installed and in PATH?", err)
+		fatal("failed to start tor", err)
 	}
 	defer t.Close()
-
 	fmt.Println("  [VEIL] tor daemon started.")
 
-	// --- Step 3: Create a v3 onion service using our Ed25519 key ---
-	// This is where our keypair becomes a REAL .onion address on the Tor network.
-	// The onion address IS derived from the public key — Tor verifies this cryptographically.
-	fmt.Println("  [VEIL] creating onion service...")
+	// Branch based on mode
+	if *listenFlag {
+		runListener(t, privateKey)
+	} else if *connectFlag != "" {
+		runDialer(t, *connectFlag)
+	}
+}
 
+// runListener handles incoming connections
+func runListener(t *tor.Tor, privateKey ed25519.PrivateKey) {
+	// Create the Onion Service in Tor
+	fmt.Println("  [VEIL] creating onion service...")
 	listenCtx, listenCancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer listenCancel()
 
-	// OnionService creates a hidden service. We pass our Ed25519 private key so
-	// our .onion address is deterministic (same key = same address, every time).
+	// bine's t.Listen creates both the Tor hidden service AND the local TCP listener automatically!
 	onion, err := t.Listen(listenCtx, &tor.ListenConf{
-		LocalPort:  7777,               // local port the service forwards to
-		RemotePorts: []int{7777},       // port exposed on the .onion address
-		Key:        privateKey,         // our Ed25519 key — this DEFINES our address
-		Version3:   true,               // use Tor v3 (Ed25519-based, 56-char addresses)
+		RemotePorts: []int{7777}, // Port exposed on the .onion address
+		Key:         privateKey,
+		Version3:    true,
 	})
 	if err != nil {
 		fatal("failed to create onion service", err)
 	}
 	defer onion.Close()
 
-	// The real address — backed by a live Tor circuit, cryptographically tied to our key
-	realAddr := onion.ID + ".onion"
+	fmt.Printf("\n  [VEIL] listening at: %s.onion\n\n", onion.ID)
 
-	fmt.Println()
-	fmt.Println("────────────────────────────────────────────────────────────────")
-	fmt.Println()
-	fmt.Println("  [VEIL] onion service active.")
-	fmt.Println()
-	fmt.Printf("  your address  :  %s\n", realAddr)
-	fmt.Printf("  public key    :  %x\n", publicKey)
-	fmt.Println()
-	fmt.Println("  share your address with trusted contacts only.")
-	fmt.Println("  veil is now listening for incoming connections.")
-	fmt.Println()
-	fmt.Println("────────────────────────────────────────────────────────────────")
-	fmt.Println()
-	fmt.Println("  press Ctrl+C to shut down.")
-	fmt.Println()
+	// onion implements net.Listener, so we can Accept() directly on it!
+	for {
+		conn, err := onion.Accept()
+		if err != nil {
+			fmt.Println("  [ERROR] failed to accept connection:", err)
+			continue
+		}
+		
+		fmt.Println("  [VEIL] incoming connection received!")
+		
+		handleSession(conn)
+		
+		fmt.Println("  [VEIL] session closed.")
+		conn.Close()
+	}
+}
 
-	// Hold the process open — the onion service lives as long as we're running
-	select {}
+// runDialer connects to another Veil node
+func runDialer(t *tor.Tor, targetAddress string) {
+	fmt.Printf("  [VEIL] connecting to %s ...\n", targetAddress)
+	
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer dialCancel()
+
+	// tor.Dialer gives us a way to connect out through the Tor network
+	dialer, err := t.Dialer(dialCtx, nil)
+	if err != nil {
+		fatal("failed to get tor dialer", err)
+	}
+
+	// Dial the remote onion address
+	conn, err := dialer.DialContext(dialCtx, "tcp", targetAddress+":7777")
+	if err != nil {
+		fatal("connection failed", err)
+	}
+	defer conn.Close()
+
+	fmt.Println("  [VEIL] connected successfully!")
+	
+	handleSession(conn)
+	fmt.Println("  [VEIL] session closed.")
+}
+
+// handleSession wires up the standard input/output to the connection for a raw chat
+func handleSession(conn net.Conn) {
+	fmt.Println("────────────────────────────────────────────────────────────────")
+	fmt.Println("  [VEIL] session established. type to chat.")
+	fmt.Println("────────────────────────────────────────────────────────────────")
+	
+	// Start a goroutine to print incoming messages to the terminal
+	go func() {
+		_, err := io.Copy(os.Stdout, conn)
+		if err != nil {
+			fmt.Println("\n  [VEIL] connection dropped.")
+		}
+	}()
+
+	// The main goroutine reads from your keyboard and sends it to the peer
+	io.Copy(conn, os.Stdin)
 }
 
 // torDataDir returns the path where Tor stores its state data.
-// Using a hidden dot-folder in the user's home directory.
-func torDataDir() string {
+func torDataDir(isListener bool) string {
+	suffix := "connect"
+	if isListener {
+		suffix = "listen"
+	}
+	
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return ".veil-tor-data" // fallback to current directory
+		return ".veil-tor-data-" + suffix
 	}
-	return home + "/.veil/tor"
+	return home + "/.veil/tor-" + suffix
 }
 
 // fatal prints a formatted error and exits.
