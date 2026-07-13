@@ -1,5 +1,6 @@
 # VEIL
-### Ephemeral. Encrypted. Untraced.
+
+### Ephemeral. Encrypted. Untraced
 
 > A session-based, P2P terminal messaging application built on Tor onion services.
 > No servers. No logs. No persistence. If you're not there to receive it, it doesn't exist.
@@ -37,6 +38,7 @@ This is not a limitation — it is a deliberate architectural philosophy.
 ## How It Works
 
 ### Identity
+
 Each user generates an **Ed25519 keypair** on first launch. No registration required.
 Your identity is your **Tor v3 onion address** — a 56-character string derived directly
 from your public key. It never changes. It cannot be faked.
@@ -49,8 +51,10 @@ Share this with someone the same way you'd share an SSH host address — out-of-
 over Signal, written on paper, spoken in person. There is no in-app directory.
 
 ### Discovery
+
 There is no discovery server. Veil does not broadcast your presence.
 You are reachable only when:
+
 1. The app is running.
 2. Someone already knows your onion address.
 
@@ -75,6 +79,7 @@ You are reachable only when:
 ```
 
 ### Encryption
+
 All traffic is end-to-end encrypted over Tor. On session establishment,
 a **session key exchange** (X25519 ECDH) is performed to derive a symmetric session key.
 This key exists only in memory. Traffic is encrypted with **ChaCha20-Poly1305**.
@@ -148,7 +153,8 @@ veil --listen --auto-accept @alice # whitelist a known address
 
 ## Threat Model
 
-### Veil protects against:
+### Veil protects against
+
 - Mass surveillance and metadata collection
 - Corporate data harvesting
 - Man-in-the-middle attacks (key is authenticated via onion address)
@@ -156,7 +162,8 @@ veil --listen --auto-accept @alice # whitelist a known address
 - Message recovery after session ends
 - Server seizure (there are no servers)
 
-### Veil does NOT protect against:
+### Veil does NOT protect against
+
 - A compromised device (keylogger, root access)
 - Someone physically watching your screen
 - Losing your private key
@@ -180,6 +187,7 @@ and **intellectual property protection** (required for sustainability).
 ## Roadmap
 
 ### Phase 1 — Core
+
 - [ ] Keypair generation on first launch
 - [ ] Embedded Tor daemon via `bine`
 - [ ] Onion service creation and display
@@ -190,6 +198,7 @@ and **intellectual property protection** (required for sustainability).
 - [ ] Basic TUI (send/receive messages)
 
 ### Phase 2 — Features
+
 - [ ] `/send` file transfer over active session
 - [ ] Contact alias system (local nickname → onion address mapping)
 - [ ] `--auto-accept` whitelist for trusted addresses
@@ -197,6 +206,7 @@ and **intellectual property protection** (required for sustainability).
 - [ ] Multi-platform builds (Linux, macOS, Windows, Android via Termux)
 
 ### Phase 3 — Hardening
+
 - [ ] Traffic padding (resist timing analysis)
 - [ ] Canary mode (detect if binary has been tampered)
 - [ ] External security audit

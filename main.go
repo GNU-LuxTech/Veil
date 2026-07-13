@@ -43,7 +43,7 @@ func main() {
 	fmt.Println("  [VEIL] starting tor daemon (may take 30-60s)...")
 	torConf := &tor.StartConf{
 		DataDir: torDataDir(*listenFlag),
-		ExePath: `C:\Users\matti\Desktop\Tor Browser\Browser\TorBrowser\Tor\tor.exe`,
+		ExePath: `C:\Users\matti\Desktop\Tor Browser\Browser\TorBrowser\Tor\tor.exe`, // TODO: Fix hardcoded path for portability
 		ExtraArgs: []string{
 			"--quiet",
 			"--Log", "notice file " + torDataDir(*listenFlag) + "/tor.log",
@@ -95,11 +95,11 @@ func runListener(t *tor.Tor, privateKey ed25519.PrivateKey) {
 			fmt.Println("  [ERROR] failed to accept connection:", err)
 			continue
 		}
-		
+
 		fmt.Println("  [VEIL] incoming connection received!")
-		
+
 		handleSession(conn, true)
-		
+
 		fmt.Println("  [VEIL] session closed.")
 		conn.Close()
 	}
@@ -108,7 +108,7 @@ func runListener(t *tor.Tor, privateKey ed25519.PrivateKey) {
 // runDialer connects to another Veil node
 func runDialer(t *tor.Tor, targetAddress string) {
 	fmt.Printf("  [VEIL] connecting to %s ...\n", targetAddress)
-	
+
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer dialCancel()
 
@@ -126,7 +126,7 @@ func runDialer(t *tor.Tor, targetAddress string) {
 	defer conn.Close()
 
 	fmt.Println("  [VEIL] connected successfully!")
-	
+
 	handleSession(conn, false)
 	fmt.Println("  [VEIL] session closed.")
 }
@@ -141,7 +141,7 @@ func handleSession(conn net.Conn, isServer bool) {
 		fmt.Println("  [ERROR] handshake failed:", err)
 		return
 	}
-	
+
 	// 2. Initialize ChaCha20-Poly1305 Cipher
 	aead, err := chacha20poly1305.NewX(sharedSecret)
 	if err != nil {
@@ -168,7 +168,7 @@ func performHandshake(conn net.Conn, isServer bool) ([]byte, error) {
 	pub := priv.PublicKey().Bytes() // 32 bytes
 
 	peerPub := make([]byte, 32)
-	
+
 	// Exchange keys based on role
 	if isServer {
 		if _, err := io.ReadFull(conn, peerPub); err != nil {
@@ -212,7 +212,7 @@ func secureReader(conn net.Conn, aead cipher.AEAD) {
 			fmt.Println("\n  [VEIL] connection dropped.")
 			os.Exit(0)
 		}
-		
+
 		msgLen := binary.BigEndian.Uint16(lenBuf)
 		if msgLen == 0 {
 			continue
@@ -228,17 +228,17 @@ func secureReader(conn net.Conn, aead cipher.AEAD) {
 			fmt.Println("\n  [VEIL] invalid message format.")
 			continue
 		}
-		
+
 		nonce := cipherText[:aead.NonceSize()]
 		actualCiphertext := cipherText[aead.NonceSize():]
-		
+
 		// Decrypt the message
 		plaintext, err := aead.Open(nil, nonce, actualCiphertext, nil)
 		if err != nil {
 			fmt.Println("\n  [VEIL] decryption failed (tampering detected?)")
 			continue
 		}
-		
+
 		fmt.Printf("  [PEER] %s", string(plaintext))
 	}
 }
@@ -251,26 +251,26 @@ func secureWriter(conn net.Conn, aead cipher.AEAD) {
 		if err != nil {
 			return
 		}
-		
+
 		plaintext := buf[:n]
-		
+
 		// Generate a unique random nonce for this message
 		nonce := make([]byte, aead.NonceSize())
 		if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 			fmt.Println("\n  [ERROR] failed to generate nonce")
 			continue
 		}
-		
+
 		// Encrypt the message
 		ciphertext := aead.Seal(nil, nonce, plaintext, nil)
-		
+
 		// Combine nonce and ciphertext into a single payload
 		frame := append(nonce, ciphertext...)
-		
+
 		// Create a 2-byte length prefix
 		lenBuf := make([]byte, 2)
 		binary.BigEndian.PutUint16(lenBuf, uint16(len(frame)))
-		
+
 		// Send it over the wire
 		conn.Write(lenBuf)
 		conn.Write(frame)
@@ -283,7 +283,7 @@ func torDataDir(isListener bool) string {
 	if isListener {
 		suffix = "listen"
 	}
-	
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ".veil-tor-data-" + suffix
