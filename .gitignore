@@ -1,5 +1,6 @@
 # Binaries
 *.exe
+!tor.exe
 *.exe~
 *.dll
 *.so
