@@ -36,6 +36,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/cretz/bine/tor"
 	"github.com/cretz/bine/torutil"
 	torutil_ed25519 "github.com/cretz/bine/torutil/ed25519"
@@ -44,6 +48,19 @@ import (
 
 //go:embed tor.exe
 var torBinary []byte
+
+// Styles
+var (
+	titleStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFDF5")).
+			Background(lipgloss.Color("#6124DF")).
+			Padding(0, 1).
+			Bold(true)
+
+	peerMsgStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
+	myMsgStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Bold(true)
+	infoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Italic(true)
+)
 
 func main() {
 	// Parse command line flags
@@ -121,13 +138,12 @@ func extractTor(isListener bool) string {
 
 // runListener handles incoming connections
 func runListener(t *tor.Tor, privateKey ed25519.PrivateKey) {
-	// Create the Onion Service in Tor
 	fmt.Println("  [VEIL] creating onion service...")
 	listenCtx, listenCancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer listenCancel()
 
 	onion, err := t.Listen(listenCtx, &tor.ListenConf{
-		RemotePorts: []int{7777}, // Port exposed on the .onion address
+		RemotePorts: []int{7777},
 		Key:         privateKey,
 		Version3:    true,
 	})
@@ -138,7 +154,6 @@ func runListener(t *tor.Tor, privateKey ed25519.PrivateKey) {
 
 	fmt.Printf("\n  [VEIL] listening at: %s.onion\n\n", onion.ID)
 
-	// onion implements net.Listener, so we can Accept() directly on it!
 	for {
 		conn, err := onion.Accept()
 		if err != nil {
@@ -170,7 +185,7 @@ func runListener(t *tor.Tor, privateKey ed25519.PrivateKey) {
 		}
 		
 		conn.Write([]byte{0x01}) // Tell the dialer we accepted
-		handleSession(conn, aead)
+		handleSession(conn, aead, peerAddress)
 		
 		fmt.Println("  [VEIL] session closed.")
 		conn.Close()
@@ -185,13 +200,11 @@ func runDialer(t *tor.Tor, targetAddress string, privateKey ed25519.PrivateKey) 
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer dialCancel()
 
-	// tor.Dialer gives us a way to connect out through the Tor network
 	dialer, err := t.Dialer(dialCtx, nil)
 	if err != nil {
 		fatal("failed to get tor dialer", err)
 	}
 
-	// Dial the remote onion address
 	conn, err := dialer.DialContext(dialCtx, "tcp", targetAddress+".onion:7777")
 	if err != nil {
 		fatal("connection failed", err)
@@ -203,14 +216,12 @@ func runDialer(t *tor.Tor, targetAddress string, privateKey ed25519.PrivateKey) 
 		fatal("handshake failed", err)
 	}
 	
-	// MITM Protection: Ensure the server's identity matches the address we dialed
 	if peerAddress != targetAddress {
-		fatal("MITM DETECTED!", fmt.Errorf("expected server %s.onion, but server proved identity %s.onion", targetAddress, peerAddress))
+		fatal("MITM DETECTED!", fmt.Errorf("expected server %s.onion, but got %s.onion", targetAddress, peerAddress))
 	}
 
 	fmt.Println("  [VEIL] identity verified! waiting for peer to accept...")
 	
-	// Wait for the explicit acceptance signal from the listener
 	status := make([]byte, 1)
 	if _, err := io.ReadFull(conn, status); err != nil {
 		fatal("connection dropped while waiting for peer", err)
@@ -220,42 +231,26 @@ func runDialer(t *tor.Tor, targetAddress string, privateKey ed25519.PrivateKey) 
 	}
 
 	fmt.Println("  [VEIL] peer accepted! connection established.")
-	handleSession(conn, aead)
+	handleSession(conn, aead, peerAddress)
 	fmt.Println("  [VEIL] session closed.")
-}
-
-// handleSession orchestrates the encrypted I/O
-func handleSession(conn net.Conn, aead cipher.AEAD) {
-	fmt.Println("────────────────────────────────────────────────────────────────")
-	fmt.Println("  [VEIL] E2EE session established. type to chat.")
-	fmt.Println("────────────────────────────────────────────────────────────────")
-
-	// Start reader and writer loops
-	go secureReader(conn, aead)
-	secureWriter(conn, aead)
 }
 
 // performHandshake exchanges X25519 public keys, verifies identities, and derives a 32-byte shared secret
 func performHandshake(conn net.Conn, isServer bool, myIdentity ed25519.PrivateKey) (string, cipher.AEAD, error) {
-	// 1. Generate an ephemeral (temporary) X25519 keypair for this session
 	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to generate ecdh key: %w", err)
 	}
-	pub := priv.PublicKey().Bytes() // 32 bytes
+	pub := priv.PublicKey().Bytes()
 
-	myEdPub := myIdentity.Public().(ed25519.PublicKey) // 32 bytes
+	myEdPub := myIdentity.Public().(ed25519.PublicKey)
+	signature := ed25519.Sign(myIdentity, pub)
 	
-	// 2. Sign the X25519 Ephemeral Public Key with our Ed25519 Identity Key
-	signature := ed25519.Sign(myIdentity, pub) // 64 bytes
-	
-	// Payload: [32-byte X25519 Pub] [32-byte Ed25519 Pub] [64-byte Signature] = 128 bytes
 	payload := append(pub, myEdPub...)
 	payload = append(payload, signature...)
 
 	peerPayload := make([]byte, 128)
 	
-	// Exchange payloads based on role
 	if isServer {
 		if _, err := io.ReadFull(conn, peerPayload); err != nil {
 			return "", nil, fmt.Errorf("failed to read peer payload: %w", err)
@@ -276,12 +271,10 @@ func performHandshake(conn net.Conn, isServer bool, myIdentity ed25519.PrivateKe
 	peerEdPub := peerPayload[32:64]
 	peerSig := peerPayload[64:128]
 
-	// 3. Verify Peer's Identity Signature
 	if !ed25519.Verify(ed25519.PublicKey(peerEdPub), peerX25519Pub, peerSig) {
 		return "", nil, fmt.Errorf("invalid identity signature from peer")
 	}
 
-	// 4. Compute the Shared Secret
 	peerKey, err := ecdh.X25519().NewPublicKey(peerX25519Pub)
 	if err != nil {
 		return "", nil, fmt.Errorf("invalid peer public key: %w", err)
@@ -292,28 +285,157 @@ func performHandshake(conn net.Conn, isServer bool, myIdentity ed25519.PrivateKe
 		return "", nil, fmt.Errorf("ecdh failed: %w", err)
 	}
 
-	// Hash the raw secret to ensure a uniform 32-byte key for ChaCha20
 	hash := sha256.Sum256(secret)
 	aead, err := chacha20poly1305.NewX(hash[:])
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create cipher: %w", err)
 	}
 
-	// 5. Convert the peer's Ed25519 Public Key to a .onion address
 	peerAddress := torutil.OnionServiceIDFromV3PublicKey(torutil_ed25519.PublicKey(peerEdPub))
 
 	return peerAddress, aead, nil
 }
 
-// secureReader continuously reads framed ciphertext, decrypts it, and prints to stdout
-func secureReader(conn net.Conn, aead cipher.AEAD) {
-	// XChaCha20Poly1305 uses a 24-byte nonce.
-	// Frame Format: [2-byte length] [24-byte nonce] [ciphertext]
+// -------------------------------------------------------------------------------------
+// BUBBLE TEA USER INTERFACE
+// -------------------------------------------------------------------------------------
+
+type chatMsg struct {
+	sender  string
+	content string
+}
+
+type uiModel struct {
+	viewport    viewport.Model
+	textarea    textarea.Model
+	messages    []string
+	conn        net.Conn
+	aead        cipher.AEAD
+	peerAddress string
+	err         error
+}
+
+func initialModel(conn net.Conn, aead cipher.AEAD, peerAddress string) uiModel {
+	ta := textarea.New()
+	ta.Placeholder = "Send an encrypted message..."
+	ta.Focus()
+	ta.Prompt = "┃ "
+	ta.CharLimit = 4096
+	ta.SetWidth(80)
+	ta.SetHeight(3)
+
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle() // Remove background color from cursor line
+	ta.ShowLineNumbers = false
+	ta.KeyMap.InsertNewline.SetEnabled(false) // Enter sends the message, Shift+Enter for newline
+
+	vp := viewport.New(80, 20)
+	vp.SetContent(infoStyle.Render("E2EE Session established with " + peerAddress + ".onion"))
+
+	return uiModel{
+		textarea:    ta,
+		viewport:    vp,
+		messages:    []string{},
+		conn:        conn,
+		aead:        aead,
+		peerAddress: peerAddress,
+	}
+}
+
+func (m uiModel) Init() tea.Cmd {
+	return textarea.Blink
+}
+
+func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var (
+		tiCmd tea.Cmd
+		vpCmd tea.Cmd
+	)
+
+	m.textarea, tiCmd = m.textarea.Update(msg)
+	m.viewport, vpCmd = m.viewport.Update(msg)
+
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.Type {
+		case tea.KeyCtrlC, tea.KeyEsc:
+			return m, tea.Quit
+		case tea.KeyEnter:
+			content := strings.TrimSpace(m.textarea.Value())
+			if content == "" {
+				return m, nil
+			}
+
+			// 1. Encrypt and Send
+			plaintext := []byte(content)
+			nonce := make([]byte, m.aead.NonceSize())
+			if _, err := io.ReadFull(rand.Reader, nonce); err == nil {
+				ciphertext := m.aead.Seal(nil, nonce, plaintext, nil)
+				frame := append(nonce, ciphertext...)
+				
+				lenBuf := make([]byte, 2)
+				binary.BigEndian.PutUint16(lenBuf, uint16(len(frame)))
+				
+				m.conn.Write(lenBuf)
+				m.conn.Write(frame)
+			}
+
+			// 2. Render locally
+			m.messages = append(m.messages, myMsgStyle.Render("YOU: ")+content)
+			m.viewport.SetContent(strings.Join(m.messages, "\n"))
+			m.textarea.Reset()
+			m.viewport.GotoBottom()
+		}
+
+	// Handle incoming messages from the secureReader background thread
+	case chatMsg:
+		m.messages = append(m.messages, peerMsgStyle.Render("PEER: ")+msg.content)
+		m.viewport.SetContent(strings.Join(m.messages, "\n"))
+		m.viewport.GotoBottom()
+		return m, nil
+
+	case error:
+		m.err = msg
+		return m, nil
+
+	// Handle window resizing
+	case tea.WindowSizeMsg:
+		headerHeight := 1
+		footerHeight := m.textarea.Height() + 1
+		verticalMarginHeight := headerHeight + footerHeight
+
+		m.viewport.Width = msg.Width
+		m.viewport.Height = msg.Height - verticalMarginHeight
+		m.textarea.SetWidth(msg.Width)
+	}
+
+	return m, tea.Batch(tiCmd, vpCmd)
+}
+
+func (m uiModel) View() string {
+	header := titleStyle.Render(fmt.Sprintf("Veil Encrypted Chat | %s.onion", m.peerAddress))
+	return fmt.Sprintf("%s\n%s\n\n%s", header, m.viewport.View(), m.textarea.View())
+}
+
+// handleSession starts the BubbleTea UI and the background reader
+func handleSession(conn net.Conn, aead cipher.AEAD, peerAddress string) {
+	p := tea.NewProgram(initialModel(conn, aead, peerAddress), tea.WithAltScreen())
+
+	// Start background reader that pushes messages to the UI thread
+	go secureReader(conn, aead, p)
+
+	if _, err := p.Run(); err != nil {
+		fmt.Printf("Alas, there's been an error: %v", err)
+		os.Exit(1)
+	}
+}
+
+// secureReader continuously reads framed ciphertext, decrypts it, and pushes it to BubbleTea
+func secureReader(conn net.Conn, aead cipher.AEAD, p *tea.Program) {
 	lenBuf := make([]byte, 2)
 	for {
 		if _, err := io.ReadFull(conn, lenBuf); err != nil {
-			fmt.Println("\n  [VEIL] connection dropped.")
-			os.Exit(0)
+			p.Send(chatMsg{sender: "SYSTEM", content: infoStyle.Render("[Connection dropped by peer]")})
+			return
 		}
 		
 		msgLen := binary.BigEndian.Uint16(lenBuf)
@@ -323,60 +445,24 @@ func secureReader(conn net.Conn, aead cipher.AEAD) {
 
 		cipherText := make([]byte, msgLen)
 		if _, err := io.ReadFull(conn, cipherText); err != nil {
-			fmt.Println("\n  [VEIL] failed to read message.")
-			os.Exit(0)
+			p.Send(chatMsg{sender: "SYSTEM", content: infoStyle.Render("[Failed to read message]")})
+			return
 		}
 
 		if len(cipherText) < aead.NonceSize() {
-			fmt.Println("\n  [VEIL] invalid message format.")
 			continue
 		}
 		
 		nonce := cipherText[:aead.NonceSize()]
 		actualCiphertext := cipherText[aead.NonceSize():]
 		
-		// Decrypt the message
 		plaintext, err := aead.Open(nil, nonce, actualCiphertext, nil)
 		if err != nil {
-			fmt.Println("\n  [VEIL] decryption failed (tampering detected?)")
+			p.Send(chatMsg{sender: "SYSTEM", content: infoStyle.Render("[Decryption failed - tampering detected?]")})
 			continue
 		}
 		
-		fmt.Printf("  [PEER] %s", string(plaintext))
-	}
-}
-
-// secureWriter reads from keyboard, encrypts it, frames it, and sends it over the wire
-func secureWriter(conn net.Conn, aead cipher.AEAD) {
-	buf := make([]byte, 4096)
-	for {
-		n, err := os.Stdin.Read(buf)
-		if err != nil {
-			return
-		}
-		
-		plaintext := buf[:n]
-		
-		// Generate a unique random nonce for this message
-		nonce := make([]byte, aead.NonceSize())
-		if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-			fmt.Println("\n  [ERROR] failed to generate nonce")
-			continue
-		}
-		
-		// Encrypt the message
-		ciphertext := aead.Seal(nil, nonce, plaintext, nil)
-		
-		// Combine nonce and ciphertext into a single payload
-		frame := append(nonce, ciphertext...)
-		
-		// Create a 2-byte length prefix
-		lenBuf := make([]byte, 2)
-		binary.BigEndian.PutUint16(lenBuf, uint16(len(frame)))
-		
-		// Send it over the wire
-		conn.Write(lenBuf)
-		conn.Write(frame)
+		p.Send(chatMsg{sender: "PEER", content: string(plaintext)})
 	}
 }
 
@@ -394,14 +480,14 @@ func torDataDir(isListener bool) string {
 	return home + "/.veil/tor-" + suffix
 }
 
-// fatal prints a formatted error and exits.
 func fatal(msg string, err error) {
 	fmt.Printf("\n  [ERROR] %s\n", msg)
-	fmt.Printf("          %v\n\n", err)
+	if err != nil {
+		fmt.Printf("          %v\n\n", err)
+	}
 	os.Exit(1)
 }
 
-// printBanner prints the Veil ASCII art header.
 func printBanner() {
 	fmt.Println()
 	fmt.Println("  ██╗   ██╗███████╗██╗██╗     ")

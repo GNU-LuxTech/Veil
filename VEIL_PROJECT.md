@@ -188,16 +188,23 @@ and **intellectual property protection** (required for sustainability).
 
 ### Phase 1 — Core
 
-- [ ] Keypair generation on first launch
-- [ ] Embedded Tor daemon via `bine`
-- [ ] Onion service creation and display
-- [ ] Outbound connection to a peer's onion address
-- [ ] Inbound connection listener with accept/reject prompt
-- [ ] X25519 session key exchange
-- [ ] ChaCha20-Poly1305 encrypted message stream
-- [ ] Basic TUI (send/receive messages)
+- [x] Keypair generation on first launch
+- [x] Embedded Tor daemon via `bine`
+- [x] Onion service creation and display
+- [x] Outbound connection to a peer's onion address
+- [x] Inbound connection listener with accept/reject prompt
+- [x] X25519 session key exchange
+- [x] ChaCha20-Poly1305 encrypted message stream
+- [x] Basic TUI (send/receive messages)
 
-### Phase 2 — Features
+### Phase 2 — Master UI
+
+- [ ] Interactive TUI Main Menu (Host vs Join)
+- [ ] Graceful CLI flag bypass (hybrid CLI/TUI mode)
+- [ ] Loading screens (Tor daemon startup, onion service creation)
+- [ ] Address input form
+
+### Phase 3 — Features
 
 - [ ] `/send` file transfer over active session
 - [ ] Contact alias system (local nickname → onion address mapping)
@@ -205,7 +212,7 @@ and **intellectual property protection** (required for sustainability).
 - [ ] Session transcript opt-in (encrypted, local only)
 - [ ] Multi-platform builds (Linux, macOS, Windows, Android via Termux)
 
-### Phase 3 — Hardening
+### Phase 4 — Hardening
 
 - [ ] Traffic padding (resist timing analysis)
 - [ ] Canary mode (detect if binary has been tampered)
