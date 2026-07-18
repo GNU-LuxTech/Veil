@@ -18,7 +18,6 @@ GNU General Public License for more details.
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/cipher"
 	"crypto/ecdh"
@@ -36,7 +35,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -51,191 +53,540 @@ var torBinary []byte
 
 // Styles
 var (
-	titleStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFDF5")).
-			Background(lipgloss.Color("#6124DF")).
-			Padding(0, 1).
-			Bold(true)
-
+	titleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFDF5")).Background(lipgloss.Color("#6124DF")).Padding(0, 1).Bold(true)
 	peerMsgStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
 	myMsgStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Bold(true)
 	infoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Italic(true)
+	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	promptStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
 )
 
+// App States
+type appState int
+
+const (
+	StateMainMenu appState = iota
+	StateInputAddress
+	StateLoading
+	StatePrompt
+	StateChat
+	StateFatalError
+)
+
+// List Item
+type menuItem string
+
+func (i menuItem) Title() string       { return string(i) }
+func (i menuItem) Description() string { return "" }
+func (i menuItem) FilterValue() string { return string(i) }
+
+// Async Messages
+type torStartedMsg struct{ tor *tor.Tor }
+type onionCreatedMsg struct{ onion *tor.OnionService }
+type incomingConnectionMsg struct {
+	conn        net.Conn
+	aead        cipher.AEAD
+	peerAddress string
+}
+type connectedMsg struct {
+	conn        net.Conn
+	aead        cipher.AEAD
+	peerAddress string
+}
+type fatalErrorMsg struct {
+	err     error
+	context string
+}
+
+type chatMsg struct {
+	content string
+	system  bool
+	dropped bool
+}
+
+type chatStream struct {
+	ch <-chan chatMsg
+}
+
+// -------------------------------------------------------------------------------------
+// CORE UI MODEL
+// -------------------------------------------------------------------------------------
+
+type uiModel struct {
+	state appState
+
+	// Cryptography & Network
+	isServer    bool
+	myIdentity  ed25519.PrivateKey
+	t           *tor.Tor
+	onion       *tor.OnionService
+	conn        net.Conn
+	aead        cipher.AEAD
+	peerAddress string
+	chatSub     chatStream
+
+	// UI Components
+	list       list.Model
+	spinner    spinner.Model
+	textinput  textinput.Model
+	viewport   viewport.Model
+	textarea   textarea.Model
+	loadingMsg string
+	fatalError string
+	messages   []string
+}
+
+func initialModel(privateKey ed25519.PrivateKey) uiModel {
+	// Main Menu List
+	items := []list.Item{menuItem("Host a Chat (Listen)"), menuItem("Join a Chat (Connect)")}
+	l := list.New(items, list.NewDefaultDelegate(), 0, 0)
+	l.Title = "Veil - Ephemeral Encrypted Chat"
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(false)
+
+	// Address Input
+	ti := textinput.New()
+	ti.Placeholder = "Enter target .onion address..."
+	ti.Focus()
+	ti.CharLimit = 156
+	ti.Width = 60
+
+	// Spinner
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+
+	// Chat UI
+	ta := textarea.New()
+	ta.Placeholder = "Send an encrypted message..."
+	ta.Focus()
+	ta.Prompt = "┃ "
+	ta.CharLimit = 4096
+	ta.SetHeight(3)
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
+	ta.ShowLineNumbers = false
+	ta.KeyMap.InsertNewline.SetEnabled(false)
+
+	vp := viewport.New(80, 20)
+
+	return uiModel{
+		state:      StateMainMenu,
+		myIdentity: privateKey,
+		list:       l,
+		spinner:    s,
+		textinput:  ti,
+		textarea:   ta,
+		viewport:   vp,
+		messages:   []string{},
+	}
+}
+
+func (m uiModel) Init() tea.Cmd {
+	// If CLI flags were provided, we bypass the main menu and instantly start loading
+	if m.state == StateLoading {
+		return tea.Batch(m.spinner.Tick, startTorCmd(m.isServer))
+	}
+	return nil
+}
+
+func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Global keybinds
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		if msg.Type == tea.KeyCtrlC {
+			if m.t != nil {
+				m.t.Close()
+			}
+			return m, tea.Quit
+		}
+	case tea.WindowSizeMsg:
+		m.list.SetSize(msg.Width, msg.Height)
+		m.textinput.Width = msg.Width - 4
+
+		headerHeight := 1
+		footerHeight := m.textarea.Height() + 1
+		m.viewport.Width = msg.Width
+		m.viewport.Height = msg.Height - (headerHeight + footerHeight)
+		m.textarea.SetWidth(msg.Width)
+	}
+
+	// State-machine updates
+	switch m.state {
+
+	case StateMainMenu:
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			if msg.Type == tea.KeyEnter {
+				i, ok := m.list.SelectedItem().(menuItem)
+				if ok && i == "Host a Chat (Listen)" {
+					m.isServer = true
+					m.state = StateLoading
+					m.loadingMsg = "Starting Tor daemon (may take 30-60s)..."
+					return m, tea.Batch(m.spinner.Tick, startTorCmd(true))
+				} else if ok && i == "Join a Chat (Connect)" {
+					m.isServer = false
+					m.state = StateInputAddress
+					return m, nil
+				}
+			}
+		}
+		var cmd tea.Cmd
+		m.list, cmd = m.list.Update(msg)
+		return m, cmd
+
+	case StateInputAddress:
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			if msg.Type == tea.KeyEnter {
+				m.peerAddress = strings.TrimSuffix(strings.TrimSpace(m.textinput.Value()), ".onion")
+				if m.peerAddress != "" {
+					m.state = StateLoading
+					m.loadingMsg = "Starting Tor daemon (may take 30-60s)..."
+					return m, tea.Batch(m.spinner.Tick, startTorCmd(false))
+				}
+			} else if msg.Type == tea.KeyEsc {
+				m.state = StateMainMenu
+				return m, nil
+			}
+		}
+		var cmd tea.Cmd
+		m.textinput, cmd = m.textinput.Update(msg)
+		return m, cmd
+
+	case StateLoading:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+
+		switch msg := msg.(type) {
+		case torStartedMsg:
+			m.t = msg.tor
+			if m.isServer {
+				m.loadingMsg = "Creating Onion Service..."
+				return m, tea.Batch(cmd, createOnionCmd(m.t, m.myIdentity))
+			} else {
+				m.loadingMsg = "Connecting to " + m.peerAddress + ".onion..."
+				return m, tea.Batch(cmd, dialPeerCmd(m.t, m.peerAddress, m.myIdentity))
+			}
+		case onionCreatedMsg:
+			m.onion = msg.onion
+			m.loadingMsg = "Listening at " + msg.onion.ID + ".onion\nWaiting for connections..."
+			return m, tea.Batch(cmd, acceptConnectionCmd(msg.onion, m.myIdentity))
+		case incomingConnectionMsg:
+			m.conn = msg.conn
+			m.aead = msg.aead
+			m.peerAddress = msg.peerAddress
+			m.state = StatePrompt
+			return m, cmd
+		case connectedMsg:
+			m.conn = msg.conn
+			m.aead = msg.aead
+			m.peerAddress = msg.peerAddress
+			m.state = StateChat
+			m.viewport.SetContent(infoStyle.Render("E2EE Session established with " + m.peerAddress + ".onion"))
+			m.chatSub = startReader(m.conn, m.aead)
+			return m, tea.Batch(cmd, waitForChatMsg(m.chatSub), textarea.Blink)
+		case fatalErrorMsg:
+			m.state = StateFatalError
+			m.fatalError = fmt.Sprintf("%s\n%v", msg.context, msg.err)
+			return m, nil
+		}
+		return m, cmd
+
+	case StatePrompt:
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			val := strings.ToLower(msg.String())
+			if val == "y" {
+				m.conn.Write([]byte{0x01})
+				m.state = StateChat
+				m.viewport.SetContent(infoStyle.Render("E2EE Session established with " + m.peerAddress + ".onion"))
+				m.chatSub = startReader(m.conn, m.aead)
+				return m, tea.Batch(waitForChatMsg(m.chatSub), textarea.Blink)
+			} else if val == "n" || msg.Type == tea.KeyEsc {
+				m.conn.Write([]byte{0x00})
+				m.conn.Close()
+				m.state = StateLoading
+				m.loadingMsg = "Connection rejected.\nListening at " + m.onion.ID + ".onion\nWaiting for connections..."
+				return m, tea.Batch(m.spinner.Tick, acceptConnectionCmd(m.onion, m.myIdentity))
+			}
+		}
+		return m, nil
+
+	case StateChat:
+		var (
+			tiCmd tea.Cmd
+			vpCmd tea.Cmd
+		)
+		m.textarea, tiCmd = m.textarea.Update(msg)
+		m.viewport, vpCmd = m.viewport.Update(msg)
+
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			if msg.Type == tea.KeyEnter {
+				content := strings.TrimSpace(m.textarea.Value())
+				if content == "" {
+					return m, nil
+				}
+
+				// Encrypt & send
+				plaintext := []byte(content)
+				nonce := make([]byte, m.aead.NonceSize())
+				if _, err := io.ReadFull(rand.Reader, nonce); err == nil {
+					ciphertext := m.aead.Seal(nil, nonce, plaintext, nil)
+					frame := append(nonce, ciphertext...)
+					lenBuf := make([]byte, 2)
+					binary.BigEndian.PutUint16(lenBuf, uint16(len(frame)))
+					m.conn.Write(lenBuf)
+					m.conn.Write(frame)
+				}
+
+				m.messages = append(m.messages, myMsgStyle.Render("YOU: ")+content)
+				m.viewport.SetContent(strings.Join(m.messages, "\n"))
+				m.textarea.Reset()
+				m.viewport.GotoBottom()
+			}
+		case chatMsg:
+			if msg.system {
+				m.messages = append(m.messages, infoStyle.Render(msg.content))
+			} else {
+				m.messages = append(m.messages, peerMsgStyle.Render("PEER: ")+msg.content)
+			}
+			m.viewport.SetContent(strings.Join(m.messages, "\n"))
+			m.viewport.GotoBottom()
+			if !msg.dropped {
+				return m, tea.Batch(tiCmd, vpCmd, waitForChatMsg(m.chatSub))
+			}
+			return m, tea.Batch(tiCmd, vpCmd)
+		}
+		return m, tea.Batch(tiCmd, vpCmd)
+
+	case StateFatalError:
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			if msg.Type == tea.KeyEsc {
+				if m.t != nil {
+					m.t.Close()
+					m.t = nil
+				}
+				m.state = StateMainMenu
+				return m, nil
+			}
+		}
+	}
+
+	return m, nil
+}
+
+func (m uiModel) View() string {
+	switch m.state {
+	case StateMainMenu:
+		return m.list.View()
+	case StateInputAddress:
+		return fmt.Sprintf("Enter Target Onion Address:\n\n%s\n\n(esc to cancel)", m.textinput.View())
+	case StateLoading:
+		return fmt.Sprintf("\n %s %s\n", m.spinner.View(), m.loadingMsg)
+	case StatePrompt:
+		return fmt.Sprintf("\n %s\n\n %s", promptStyle.Render("INCOMING CONNECTION FROM: "+m.peerAddress+".onion"), "Accept? (y/n)")
+	case StateChat:
+		header := titleStyle.Render(fmt.Sprintf("Veil Encrypted Chat | %s.onion", m.peerAddress))
+		return fmt.Sprintf("%s\n%s\n\n%s", header, m.viewport.View(), m.textarea.View())
+	case StateFatalError:
+		return fmt.Sprintf("\n %s\n %s\n\n (esc to return to menu)", errorStyle.Render("[FATAL ERROR]"), m.fatalError)
+	}
+	return ""
+}
+
+// -------------------------------------------------------------------------------------
+// BACKGROUND COMMANDS
+// -------------------------------------------------------------------------------------
+
+func startTorCmd(isServer bool) tea.Cmd {
+	return func() tea.Msg {
+		extractedExe := extractTor(isServer)
+		torConf := &tor.StartConf{
+			DataDir: torDataDir(isServer),
+			ExePath: extractedExe,
+			ExtraArgs: []string{
+				"--quiet",
+				"--Log", "notice file " + filepath.Join(torDataDir(isServer), "tor.log"),
+			},
+		}
+		ctx := context.Background()
+
+		t, err := tor.Start(ctx, torConf)
+		if err != nil {
+			return fatalErrorMsg{err: err, context: "Failed to start Tor daemon"}
+		}
+		return torStartedMsg{tor: t}
+	}
+}
+
+func createOnionCmd(t *tor.Tor, privateKey ed25519.PrivateKey) tea.Cmd {
+	return func() tea.Msg {
+		listenCtx, listenCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer listenCancel()
+
+		onion, err := t.Listen(listenCtx, &tor.ListenConf{
+			RemotePorts: []int{7777},
+			Key:         privateKey,
+			Version3:    true,
+		})
+		if err != nil {
+			return fatalErrorMsg{err: err, context: "Failed to create Onion Service"}
+		}
+		return onionCreatedMsg{onion: onion}
+	}
+}
+
+func acceptConnectionCmd(onion *tor.OnionService, privateKey ed25519.PrivateKey) tea.Cmd {
+	return func() tea.Msg {
+		conn, err := onion.Accept()
+		if err != nil {
+			return fatalErrorMsg{err: err, context: "Failed to accept connection"}
+		}
+		peerAddress, aead, err := performHandshake(conn, true, privateKey)
+		if err != nil {
+			conn.Close()
+			return fatalErrorMsg{err: err, context: "Handshake failed"}
+		}
+		return incomingConnectionMsg{conn: conn, aead: aead, peerAddress: peerAddress}
+	}
+}
+
+func dialPeerCmd(t *tor.Tor, targetAddress string, privateKey ed25519.PrivateKey) tea.Cmd {
+	return func() tea.Msg {
+		dialCtx, dialCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer dialCancel()
+
+		dialer, err := t.Dialer(dialCtx, nil)
+		if err != nil {
+			return fatalErrorMsg{err: err, context: "Failed to get tor dialer"}
+		}
+
+		conn, err := dialer.DialContext(dialCtx, "tcp", targetAddress+".onion:7777")
+		if err != nil {
+			return fatalErrorMsg{err: err, context: "Connection failed"}
+		}
+
+		peerAddress, aead, err := performHandshake(conn, false, privateKey)
+		if err != nil {
+			conn.Close()
+			return fatalErrorMsg{err: err, context: "Handshake failed"}
+		}
+
+		if peerAddress != targetAddress {
+			conn.Close()
+			return fatalErrorMsg{err: fmt.Errorf("expected %s, got %s", targetAddress, peerAddress), context: "MITM DETECTED!"}
+		}
+
+		status := make([]byte, 1)
+		if _, err := io.ReadFull(conn, status); err != nil {
+			conn.Close()
+			return fatalErrorMsg{err: err, context: "Dropped while waiting for peer acceptance"}
+		}
+		if status[0] == 0x00 {
+			conn.Close()
+			return fatalErrorMsg{err: fmt.Errorf("Connection rejected"), context: "Peer rejected connection"}
+		}
+
+		return connectedMsg{conn: conn, aead: aead, peerAddress: peerAddress}
+	}
+}
+
+func startReader(conn net.Conn, aead cipher.AEAD) chatStream {
+	ch := make(chan chatMsg)
+	go func() {
+		lenBuf := make([]byte, 2)
+		for {
+			if _, err := io.ReadFull(conn, lenBuf); err != nil {
+				ch <- chatMsg{content: "[Connection dropped by peer]", system: true, dropped: true}
+				return
+			}
+			msgLen := binary.BigEndian.Uint16(lenBuf)
+			if msgLen == 0 {
+				continue
+			}
+
+			cipherText := make([]byte, msgLen)
+			if _, err := io.ReadFull(conn, cipherText); err != nil {
+				ch <- chatMsg{content: "[Failed to read message]", system: true, dropped: true}
+				return
+			}
+
+			if len(cipherText) < aead.NonceSize() {
+				continue
+			}
+
+			nonce := cipherText[:aead.NonceSize()]
+			actualCiphertext := cipherText[aead.NonceSize():]
+
+			plaintext, err := aead.Open(nil, nonce, actualCiphertext, nil)
+			if err != nil {
+				ch <- chatMsg{content: "[Decryption failed - tampering detected?]", system: true}
+				continue
+			}
+
+			ch <- chatMsg{content: string(plaintext), system: false}
+		}
+	}()
+	return chatStream{ch: ch}
+}
+
+func waitForChatMsg(sub chatStream) tea.Cmd {
+	return func() tea.Msg {
+		return <-sub.ch
+	}
+}
+
+// -------------------------------------------------------------------------------------
+// CORE LOGIC
+// -------------------------------------------------------------------------------------
+
 func main() {
-	// Parse command line flags
 	listenFlag := flag.Bool("listen", false, "Listen for incoming connections")
 	connectFlag := flag.String("connect", "", "Connect to a peer's onion address")
 	flag.Parse()
 
-	printBanner()
-
-	if !*listenFlag && *connectFlag == "" {
-		fmt.Println("  [VEIL] Please specify --listen or --connect <address>")
+	// Step 1: Generate Identity
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		fmt.Println("failed to generate keypair:", err)
 		os.Exit(1)
 	}
 
-	// Step 1: Generate Identity
-	fmt.Println("  [VEIL] generating identity keypair...")
-	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		fatal("failed to generate keypair", err)
-	}
+	m := initialModel(privateKey)
 
-	// Step 1.5: Extract Embedded Tor
-	extractedExe := extractTor(*listenFlag)
-
-	// Step 2: Start Tor Daemon
-	fmt.Println("  [VEIL] starting tor daemon (may take 30-60s)...")
-	torConf := &tor.StartConf{
-		DataDir: torDataDir(*listenFlag),
-		ExePath: extractedExe, // Point to our newly extracted binary!
-		ExtraArgs: []string{
-			"--quiet",
-			"--Log", "notice file " + filepath.Join(torDataDir(*listenFlag), "tor.log"),
-		},
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-
-	t, err := tor.Start(ctx, torConf)
-	if err != nil {
-		fatal("failed to start tor", err)
-	}
-	defer t.Close()
-	fmt.Println("  [VEIL] tor daemon started.")
-
-	// Branch based on mode
+	// Hybrid Fast-Track: if flags were provided, bypass the Main Menu
 	if *listenFlag {
-		runListener(t, privateKey)
+		m.isServer = true
+		m.state = StateLoading
+		m.loadingMsg = "Starting Tor daemon (may take 30-60s)..."
 	} else if *connectFlag != "" {
-		runDialer(t, *connectFlag, privateKey)
+		m.isServer = false
+		m.peerAddress = strings.TrimSuffix(*connectFlag, ".onion")
+		m.state = StateLoading
+		m.loadingMsg = "Starting Tor daemon (may take 30-60s)..."
+	}
+
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		fmt.Printf("Error: %v", err)
+		os.Exit(1)
 	}
 }
 
-// extractTor writes the embedded tor.exe to the data directory so we can run it
 func extractTor(isListener bool) string {
 	dataDir := torDataDir(isListener)
-	
-	// Ensure the directory exists
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
-		fatal("failed to create tor data directory", err)
+		return "" // Will crash later on start
 	}
-
 	exePath := filepath.Join(dataDir, "tor.exe")
-	
-	// Check if we already extracted it (to save time on reboot)
 	if _, err := os.Stat(exePath); os.IsNotExist(err) {
-		fmt.Println("  [VEIL] extracting embedded tor binary...")
-		if err := os.WriteFile(exePath, torBinary, 0700); err != nil {
-			fatal("failed to extract tor binary", err)
-		}
+		os.WriteFile(exePath, torBinary, 0700)
 	}
-	
 	return exePath
 }
 
-// runListener handles incoming connections
-func runListener(t *tor.Tor, privateKey ed25519.PrivateKey) {
-	fmt.Println("  [VEIL] creating onion service...")
-	listenCtx, listenCancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer listenCancel()
-
-	onion, err := t.Listen(listenCtx, &tor.ListenConf{
-		RemotePorts: []int{7777},
-		Key:         privateKey,
-		Version3:    true,
-	})
-	if err != nil {
-		fatal("failed to create onion service", err)
-	}
-	defer onion.Close()
-
-	fmt.Printf("\n  [VEIL] listening at: %s.onion\n\n", onion.ID)
-
-	for {
-		conn, err := onion.Accept()
-		if err != nil {
-			fmt.Println("  [ERROR] failed to accept connection:", err)
-			continue
-		}
-		
-		fmt.Println("  [VEIL] incoming connection received! authenticating...")
-		
-		peerAddress, aead, err := performHandshake(conn, true, privateKey)
-		if err != nil {
-			fmt.Println("  [ERROR] connection rejected (handshake failed):", err)
-			conn.Close()
-			continue
-		}
-
-		fmt.Printf("\n  [!] INCOMING CONNECTION FROM: %s.onion\n", peerAddress)
-		fmt.Print("  Accept? (y/n): ")
-		
-		reader := bufio.NewReader(os.Stdin)
-		response, _ := reader.ReadString('\n')
-		response = strings.TrimSpace(strings.ToLower(response))
-		
-		if response != "y" && response != "yes" {
-			fmt.Println("  [VEIL] connection rejected.")
-			conn.Write([]byte{0x00}) // Tell the dialer we rejected
-			conn.Close()
-			continue
-		}
-		
-		conn.Write([]byte{0x01}) // Tell the dialer we accepted
-		handleSession(conn, aead, peerAddress)
-		
-		fmt.Println("  [VEIL] session closed.")
-		conn.Close()
-	}
-}
-
-// runDialer connects to another Veil node
-func runDialer(t *tor.Tor, targetAddress string, privateKey ed25519.PrivateKey) {
-	targetAddress = strings.TrimSuffix(targetAddress, ".onion")
-	fmt.Printf("  [VEIL] connecting to %s.onion ...\n", targetAddress)
-	
-	dialCtx, dialCancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer dialCancel()
-
-	dialer, err := t.Dialer(dialCtx, nil)
-	if err != nil {
-		fatal("failed to get tor dialer", err)
-	}
-
-	conn, err := dialer.DialContext(dialCtx, "tcp", targetAddress+".onion:7777")
-	if err != nil {
-		fatal("connection failed", err)
-	}
-	defer conn.Close()
-
-	peerAddress, aead, err := performHandshake(conn, false, privateKey)
-	if err != nil {
-		fatal("handshake failed", err)
-	}
-	
-	if peerAddress != targetAddress {
-		fatal("MITM DETECTED!", fmt.Errorf("expected server %s.onion, but got %s.onion", targetAddress, peerAddress))
-	}
-
-	fmt.Println("  [VEIL] identity verified! waiting for peer to accept...")
-	
-	status := make([]byte, 1)
-	if _, err := io.ReadFull(conn, status); err != nil {
-		fatal("connection dropped while waiting for peer", err)
-	}
-	if status[0] == 0x00 {
-		fatal("connection rejected by peer", nil)
-	}
-
-	fmt.Println("  [VEIL] peer accepted! connection established.")
-	handleSession(conn, aead, peerAddress)
-	fmt.Println("  [VEIL] session closed.")
-}
-
-// performHandshake exchanges X25519 public keys, verifies identities, and derives a 32-byte shared secret
 func performHandshake(conn net.Conn, isServer bool, myIdentity ed25519.PrivateKey) (string, cipher.AEAD, error) {
 	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
@@ -245,12 +596,12 @@ func performHandshake(conn net.Conn, isServer bool, myIdentity ed25519.PrivateKe
 
 	myEdPub := myIdentity.Public().(ed25519.PublicKey)
 	signature := ed25519.Sign(myIdentity, pub)
-	
+
 	payload := append(pub, myEdPub...)
 	payload = append(payload, signature...)
 
 	peerPayload := make([]byte, 128)
-	
+
 	if isServer {
 		if _, err := io.ReadFull(conn, peerPayload); err != nil {
 			return "", nil, fmt.Errorf("failed to read peer payload: %w", err)
@@ -292,213 +643,17 @@ func performHandshake(conn net.Conn, isServer bool, myIdentity ed25519.PrivateKe
 	}
 
 	peerAddress := torutil.OnionServiceIDFromV3PublicKey(torutil_ed25519.PublicKey(peerEdPub))
-
 	return peerAddress, aead, nil
 }
 
-// -------------------------------------------------------------------------------------
-// BUBBLE TEA USER INTERFACE
-// -------------------------------------------------------------------------------------
-
-type chatMsg struct {
-	sender  string
-	content string
-}
-
-type uiModel struct {
-	viewport    viewport.Model
-	textarea    textarea.Model
-	messages    []string
-	conn        net.Conn
-	aead        cipher.AEAD
-	peerAddress string
-	err         error
-}
-
-func initialModel(conn net.Conn, aead cipher.AEAD, peerAddress string) uiModel {
-	ta := textarea.New()
-	ta.Placeholder = "Send an encrypted message..."
-	ta.Focus()
-	ta.Prompt = "┃ "
-	ta.CharLimit = 4096
-	ta.SetWidth(80)
-	ta.SetHeight(3)
-
-	ta.FocusedStyle.CursorLine = lipgloss.NewStyle() // Remove background color from cursor line
-	ta.ShowLineNumbers = false
-	ta.KeyMap.InsertNewline.SetEnabled(false) // Enter sends the message, Shift+Enter for newline
-
-	vp := viewport.New(80, 20)
-	vp.SetContent(infoStyle.Render("E2EE Session established with " + peerAddress + ".onion"))
-
-	return uiModel{
-		textarea:    ta,
-		viewport:    vp,
-		messages:    []string{},
-		conn:        conn,
-		aead:        aead,
-		peerAddress: peerAddress,
-	}
-}
-
-func (m uiModel) Init() tea.Cmd {
-	return textarea.Blink
-}
-
-func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var (
-		tiCmd tea.Cmd
-		vpCmd tea.Cmd
-	)
-
-	m.textarea, tiCmd = m.textarea.Update(msg)
-	m.viewport, vpCmd = m.viewport.Update(msg)
-
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.Type {
-		case tea.KeyCtrlC, tea.KeyEsc:
-			return m, tea.Quit
-		case tea.KeyEnter:
-			content := strings.TrimSpace(m.textarea.Value())
-			if content == "" {
-				return m, nil
-			}
-
-			// 1. Encrypt and Send
-			plaintext := []byte(content)
-			nonce := make([]byte, m.aead.NonceSize())
-			if _, err := io.ReadFull(rand.Reader, nonce); err == nil {
-				ciphertext := m.aead.Seal(nil, nonce, plaintext, nil)
-				frame := append(nonce, ciphertext...)
-				
-				lenBuf := make([]byte, 2)
-				binary.BigEndian.PutUint16(lenBuf, uint16(len(frame)))
-				
-				m.conn.Write(lenBuf)
-				m.conn.Write(frame)
-			}
-
-			// 2. Render locally
-			m.messages = append(m.messages, myMsgStyle.Render("YOU: ")+content)
-			m.viewport.SetContent(strings.Join(m.messages, "\n"))
-			m.textarea.Reset()
-			m.viewport.GotoBottom()
-		}
-
-	// Handle incoming messages from the secureReader background thread
-	case chatMsg:
-		m.messages = append(m.messages, peerMsgStyle.Render("PEER: ")+msg.content)
-		m.viewport.SetContent(strings.Join(m.messages, "\n"))
-		m.viewport.GotoBottom()
-		return m, nil
-
-	case error:
-		m.err = msg
-		return m, nil
-
-	// Handle window resizing
-	case tea.WindowSizeMsg:
-		headerHeight := 1
-		footerHeight := m.textarea.Height() + 1
-		verticalMarginHeight := headerHeight + footerHeight
-
-		m.viewport.Width = msg.Width
-		m.viewport.Height = msg.Height - verticalMarginHeight
-		m.textarea.SetWidth(msg.Width)
-	}
-
-	return m, tea.Batch(tiCmd, vpCmd)
-}
-
-func (m uiModel) View() string {
-	header := titleStyle.Render(fmt.Sprintf("Veil Encrypted Chat | %s.onion", m.peerAddress))
-	return fmt.Sprintf("%s\n%s\n\n%s", header, m.viewport.View(), m.textarea.View())
-}
-
-// handleSession starts the BubbleTea UI and the background reader
-func handleSession(conn net.Conn, aead cipher.AEAD, peerAddress string) {
-	p := tea.NewProgram(initialModel(conn, aead, peerAddress), tea.WithAltScreen())
-
-	// Start background reader that pushes messages to the UI thread
-	go secureReader(conn, aead, p)
-
-	if _, err := p.Run(); err != nil {
-		fmt.Printf("Alas, there's been an error: %v", err)
-		os.Exit(1)
-	}
-}
-
-// secureReader continuously reads framed ciphertext, decrypts it, and pushes it to BubbleTea
-func secureReader(conn net.Conn, aead cipher.AEAD, p *tea.Program) {
-	lenBuf := make([]byte, 2)
-	for {
-		if _, err := io.ReadFull(conn, lenBuf); err != nil {
-			p.Send(chatMsg{sender: "SYSTEM", content: infoStyle.Render("[Connection dropped by peer]")})
-			return
-		}
-		
-		msgLen := binary.BigEndian.Uint16(lenBuf)
-		if msgLen == 0 {
-			continue
-		}
-
-		cipherText := make([]byte, msgLen)
-		if _, err := io.ReadFull(conn, cipherText); err != nil {
-			p.Send(chatMsg{sender: "SYSTEM", content: infoStyle.Render("[Failed to read message]")})
-			return
-		}
-
-		if len(cipherText) < aead.NonceSize() {
-			continue
-		}
-		
-		nonce := cipherText[:aead.NonceSize()]
-		actualCiphertext := cipherText[aead.NonceSize():]
-		
-		plaintext, err := aead.Open(nil, nonce, actualCiphertext, nil)
-		if err != nil {
-			p.Send(chatMsg{sender: "SYSTEM", content: infoStyle.Render("[Decryption failed - tampering detected?]")})
-			continue
-		}
-		
-		p.Send(chatMsg{sender: "PEER", content: string(plaintext)})
-	}
-}
-
-// torDataDir returns the path where Tor stores its state data.
 func torDataDir(isListener bool) string {
 	suffix := "connect"
 	if isListener {
 		suffix = "listen"
 	}
-	
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ".veil-tor-data-" + suffix
 	}
 	return home + "/.veil/tor-" + suffix
-}
-
-func fatal(msg string, err error) {
-	fmt.Printf("\n  [ERROR] %s\n", msg)
-	if err != nil {
-		fmt.Printf("          %v\n\n", err)
-	}
-	os.Exit(1)
-}
-
-func printBanner() {
-	fmt.Println()
-	fmt.Println("  ██╗   ██╗███████╗██╗██╗     ")
-	fmt.Println("  ██║   ██║██╔════╝██║██║     ")
-	fmt.Println("  ██║   ██║█████╗  ██║██║     ")
-	fmt.Println("  ╚██╗ ██╔╝██╔══╝  ██║██║     ")
-	fmt.Println("   ╚████╔╝ ███████╗██║███████╗")
-	fmt.Println("    ╚═══╝  ╚══════╝╚═╝╚══════╝")
-	fmt.Println()
-	fmt.Println("  ephemeral. encrypted. untraced.")
-	fmt.Println()
-	fmt.Println("────────────────────────────────────────────────────────────────")
-	fmt.Println()
 }
