@@ -199,10 +199,10 @@ and **intellectual property protection** (required for sustainability).
 
 ### Phase 2 — Master UI
 
-- [ ] Interactive TUI Main Menu (Host vs Join)
-- [ ] Graceful CLI flag bypass (hybrid CLI/TUI mode)
-- [ ] Loading screens (Tor daemon startup, onion service creation)
-- [ ] Address input form
+- [x] Interactive TUI Main Menu (Host vs Join)
+- [x] Graceful CLI flag bypass (hybrid CLI/TUI mode)
+- [x] Loading screens (Tor daemon startup, onion service creation)
+- [x] Address input form
 
 ### Phase 3 — Features
 
