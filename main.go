@@ -32,6 +32,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -51,17 +52,26 @@ import (
 //go:embed tor.exe
 var torBinary []byte
 
-// Styles
+// -------------------------------------------------------------------------------------
+// STYLES
+// -------------------------------------------------------------------------------------
+
 var (
-	titleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFDF5")).Background(lipgloss.Color("#6124DF")).Padding(0, 1).Bold(true)
+	titleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFDF5")).Background(lipgloss.Color("#6124DF")).Padding(0, 1).Bold(true)
 	peerMsgStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
 	myMsgStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Bold(true)
 	infoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Italic(true)
 	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
 	promptStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
+	cmdStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("75")).Italic(true)
+	focusedStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("205"))
+	dimStyle     = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("241"))
 )
 
-// App States
+// -------------------------------------------------------------------------------------
+// APP STATES
+// -------------------------------------------------------------------------------------
+
 type appState int
 
 const (
@@ -73,14 +83,31 @@ const (
 	StateFatalError
 )
 
-// List Item
+// -------------------------------------------------------------------------------------
+// LIST ITEM TYPES
+// -------------------------------------------------------------------------------------
+
+// menuItem is used for the main menu.
 type menuItem string
 
 func (i menuItem) Title() string       { return string(i) }
 func (i menuItem) Description() string { return "" }
 func (i menuItem) FilterValue() string { return string(i) }
 
-// Async Messages
+// contactItem is used for the contacts list in the join screen.
+type contactItem struct {
+	name    string
+	address string
+}
+
+func (i contactItem) Title() string       { return i.name }
+func (i contactItem) Description() string { return i.address + ".onion" }
+func (i contactItem) FilterValue() string { return i.name }
+
+// -------------------------------------------------------------------------------------
+// ASYNC MESSAGES
+// -------------------------------------------------------------------------------------
+
 type torStartedMsg struct{ tor *tor.Tor }
 type onionCreatedMsg struct{ onion *tor.OnionService }
 type incomingConnectionMsg struct {
@@ -97,13 +124,11 @@ type fatalErrorMsg struct {
 	err     error
 	context string
 }
-
 type chatMsg struct {
 	content string
 	system  bool
 	dropped bool
 }
-
 type chatStream struct {
 	ch <-chan chatMsg
 }
@@ -123,30 +148,44 @@ type uiModel struct {
 	conn        net.Conn
 	aead        cipher.AEAD
 	peerAddress string
+	peerNick    string // nickname if peer is a saved contact
 	chatSub     chatStream
 
+	// Contacts
+	contacts        map[string]string // name → address
+	joinFocusList   bool              // true = navigating contacts, false = typing address
+
 	// UI Components
-	list       list.Model
-	spinner    spinner.Model
-	textinput  textinput.Model
-	viewport   viewport.Model
-	textarea   textarea.Model
-	loadingMsg string
-	fatalError string
-	messages   []string
+	list         list.Model
+	contactsList list.Model
+	spinner      spinner.Model
+	textinput    textinput.Model
+	viewport     viewport.Model
+	textarea     textarea.Model
+	loadingMsg   string
+	fatalError   string
+	messages     []string
+	windowWidth  int
+	windowHeight int
 }
 
-func initialModel(privateKey ed25519.PrivateKey) uiModel {
-	// Main Menu List
+func initialModel(privateKey ed25519.PrivateKey, contacts map[string]string) uiModel {
+	// Main Menu
 	items := []list.Item{menuItem("Host a Chat (Listen)"), menuItem("Join a Chat (Connect)")}
 	l := list.New(items, list.NewDefaultDelegate(), 0, 0)
-	l.Title = "Veil - Ephemeral Encrypted Chat"
+	l.Title = "Veil — Ephemeral Encrypted Chat"
 	l.SetShowStatusBar(false)
 	l.SetFilteringEnabled(false)
 
+	// Contacts list (pre-initialized as empty so WindowSizeMsg never hits a zero-value model)
+	cl := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
+	cl.Title = "Saved Contacts"
+	cl.SetShowStatusBar(false)
+	cl.SetFilteringEnabled(false)
+
 	// Address Input
 	ti := textinput.New()
-	ti.Placeholder = "Enter target .onion address..."
+	ti.Placeholder = "Paste .onion address here..."
 	ti.Focus()
 	ti.CharLimit = 156
 	ti.Width = 60
@@ -158,7 +197,7 @@ func initialModel(privateKey ed25519.PrivateKey) uiModel {
 
 	// Chat UI
 	ta := textarea.New()
-	ta.Placeholder = "Send an encrypted message..."
+	ta.Placeholder = "Send a message... (/add <name> to save contact, /remove <name> to delete)"
 	ta.Focus()
 	ta.Prompt = "┃ "
 	ta.CharLimit = 4096
@@ -170,19 +209,40 @@ func initialModel(privateKey ed25519.PrivateKey) uiModel {
 	vp := viewport.New(80, 20)
 
 	return uiModel{
-		state:      StateMainMenu,
-		myIdentity: privateKey,
-		list:       l,
-		spinner:    s,
-		textinput:  ti,
-		textarea:   ta,
-		viewport:   vp,
-		messages:   []string{},
+		state:        StateMainMenu,
+		myIdentity:   privateKey,
+		contacts:     contacts,
+		list:         l,
+		contactsList: cl,
+		spinner:      s,
+		textinput:    ti,
+		textarea:     ta,
+		viewport:     vp,
+		messages:     []string{},
 	}
 }
 
+// buildContactsList creates a list.Model from the current contacts map for the join screen.
+func buildContactsList(contacts map[string]string, w, h int) list.Model {
+	names := make([]string, 0, len(contacts))
+	for name := range contacts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	items := make([]list.Item, 0, len(names))
+	for _, name := range names {
+		items = append(items, contactItem{name: name, address: contacts[name]})
+	}
+
+	cl := list.New(items, list.NewDefaultDelegate(), w, h)
+	cl.Title = "Saved Contacts"
+	cl.SetShowStatusBar(false)
+	cl.SetFilteringEnabled(false)
+	return cl
+}
+
 func (m uiModel) Init() tea.Cmd {
-	// If CLI flags were provided, we bypass the main menu and instantly start loading
 	if m.state == StateLoading {
 		return tea.Batch(m.spinner.Tick, startTorCmd(m.isServer))
 	}
@@ -190,7 +250,7 @@ func (m uiModel) Init() tea.Cmd {
 }
 
 func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// Global keybinds
+	// Global keybinds & window resize
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyCtrlC {
@@ -200,6 +260,9 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 	case tea.WindowSizeMsg:
+		m.windowWidth = msg.Width
+		m.windowHeight = msg.Height
+
 		m.list.SetSize(msg.Width, msg.Height)
 		m.textinput.Width = msg.Width - 4
 
@@ -208,11 +271,19 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.Width = msg.Width
 		m.viewport.Height = msg.Height - (headerHeight + footerHeight)
 		m.textarea.SetWidth(msg.Width)
+
+		// Resize contacts list: half height for the join screen
+		contactsH := msg.Height/2 - 4
+		if contactsH < 3 {
+			contactsH = 3
+		}
+		m.contactsList.SetSize(msg.Width-4, contactsH)
 	}
 
 	// State-machine updates
 	switch m.state {
 
+	// ── MAIN MENU ──────────────────────────────────────────────────────────────
 	case StateMainMenu:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -226,6 +297,15 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else if ok && i == "Join a Chat (Connect)" {
 					m.isServer = false
 					m.state = StateInputAddress
+					// Rebuild contacts list with current window size
+					contactsH := m.windowHeight/2 - 4
+					if contactsH < 3 {
+						contactsH = 3
+					}
+					m.contactsList = buildContactsList(m.contacts, m.windowWidth-4, contactsH)
+					// Default focus: list if contacts exist, input otherwise
+					m.joinFocusList = len(m.contacts) > 0
+					m.textinput.SetValue("")
 					return m, nil
 				}
 			}
@@ -234,25 +314,49 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.list, cmd = m.list.Update(msg)
 		return m, cmd
 
+	// ── ADDRESS / CONTACTS INPUT ────────────────────────────────────────────────
 	case StateInputAddress:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
-			if msg.Type == tea.KeyEnter {
-				m.peerAddress = strings.TrimSuffix(strings.TrimSpace(m.textinput.Value()), ".onion")
-				if m.peerAddress != "" {
+			switch msg.Type {
+			case tea.KeyEsc:
+				m.state = StateMainMenu
+				return m, nil
+
+			case tea.KeyTab:
+				if len(m.contacts) > 0 {
+					m.joinFocusList = !m.joinFocusList
+					return m, nil
+				}
+
+			case tea.KeyEnter:
+				var targetAddress string
+				if m.joinFocusList {
+					if item, ok := m.contactsList.SelectedItem().(contactItem); ok {
+						targetAddress = item.address
+					}
+				} else {
+					targetAddress = strings.TrimSuffix(strings.TrimSpace(m.textinput.Value()), ".onion")
+				}
+				if targetAddress != "" {
+					m.peerAddress = targetAddress
 					m.state = StateLoading
 					m.loadingMsg = "Starting Tor daemon (may take 30-60s)..."
 					return m, tea.Batch(m.spinner.Tick, startTorCmd(false))
 				}
-			} else if msg.Type == tea.KeyEsc {
-				m.state = StateMainMenu
-				return m, nil
 			}
+		}
+		// Route key events to the focused widget
+		if m.joinFocusList {
+			var cmd tea.Cmd
+			m.contactsList, cmd = m.contactsList.Update(msg)
+			return m, cmd
 		}
 		var cmd tea.Cmd
 		m.textinput, cmd = m.textinput.Update(msg)
 		return m, cmd
 
+	// ── LOADING ─────────────────────────────────────────────────────────────────
 	case StateLoading:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
@@ -263,28 +367,34 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.isServer {
 				m.loadingMsg = "Creating Onion Service..."
 				return m, tea.Batch(cmd, createOnionCmd(m.t, m.myIdentity))
-			} else {
-				m.loadingMsg = "Connecting to " + m.peerAddress + ".onion..."
-				return m, tea.Batch(cmd, dialPeerCmd(m.t, m.peerAddress, m.myIdentity))
 			}
+			m.loadingMsg = "Connecting to " + m.peerAddress + ".onion..."
+			return m, tea.Batch(cmd, dialPeerCmd(m.t, m.peerAddress, m.myIdentity))
+
 		case onionCreatedMsg:
 			m.onion = msg.onion
 			m.loadingMsg = "Listening at " + msg.onion.ID + ".onion\nWaiting for connections..."
 			return m, tea.Batch(cmd, acceptConnectionCmd(msg.onion, m.myIdentity))
+
 		case incomingConnectionMsg:
 			m.conn = msg.conn
 			m.aead = msg.aead
 			m.peerAddress = msg.peerAddress
+			m.peerNick = LookupNickname(m.contacts, msg.peerAddress)
 			m.state = StatePrompt
 			return m, cmd
+
 		case connectedMsg:
 			m.conn = msg.conn
 			m.aead = msg.aead
 			m.peerAddress = msg.peerAddress
+			m.peerNick = LookupNickname(m.contacts, msg.peerAddress)
 			m.state = StateChat
-			m.viewport.SetContent(infoStyle.Render("E2EE Session established with " + m.peerAddress + ".onion"))
+			m.messages = []string{}
+			m.viewport.SetContent(infoStyle.Render("E2EE session established with " + m.peerDisplayName() + ". Type /add <name> to save this contact."))
 			m.chatSub = startReader(m.conn, m.aead)
 			return m, tea.Batch(cmd, waitForChatMsg(m.chatSub), textarea.Blink)
+
 		case fatalErrorMsg:
 			m.state = StateFatalError
 			m.fatalError = fmt.Sprintf("%s\n%v", msg.context, msg.err)
@@ -292,6 +402,7 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, cmd
 
+	// ── ACCEPT / REJECT PROMPT ──────────────────────────────────────────────────
 	case StatePrompt:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -299,7 +410,8 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if val == "y" {
 				m.conn.Write([]byte{0x01})
 				m.state = StateChat
-				m.viewport.SetContent(infoStyle.Render("E2EE Session established with " + m.peerAddress + ".onion"))
+				m.messages = []string{}
+				m.viewport.SetContent(infoStyle.Render("E2EE session established with " + m.peerDisplayName() + ". Type /add <name> to save this contact."))
 				m.chatSub = startReader(m.conn, m.aead)
 				return m, tea.Batch(waitForChatMsg(m.chatSub), textarea.Blink)
 			} else if val == "n" || msg.Type == tea.KeyEsc {
@@ -312,6 +424,7 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	// ── CHAT ────────────────────────────────────────────────────────────────────
 	case StateChat:
 		var (
 			tiCmd tea.Cmd
@@ -324,11 +437,47 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyMsg:
 			if msg.Type == tea.KeyEnter {
 				content := strings.TrimSpace(m.textarea.Value())
+				m.textarea.Reset()
 				if content == "" {
-					return m, nil
+					return m, tea.Batch(tiCmd, vpCmd)
 				}
 
-				// Encrypt & send
+				// ── Slash commands ─────────────────────────────────────────────
+				if strings.HasPrefix(content, "/add ") {
+					nickname := strings.TrimSpace(strings.TrimPrefix(content, "/add "))
+					if nickname == "" {
+						m.appendSystem("Usage: /add <nickname>")
+					} else if err := AddContact(nickname, m.peerAddress); err != nil {
+						m.appendSystem("Error saving contact: " + err.Error())
+					} else {
+						m.contacts[strings.ToLower(nickname)] = m.peerAddress
+						m.peerNick = nickname
+						m.appendSystem(cmdStyle.Render("✓ Contact saved: \"" + nickname + "\" → " + m.peerAddress + ".onion"))
+					}
+					m.viewport.SetContent(strings.Join(m.messages, "\n"))
+					m.viewport.GotoBottom()
+					return m, tea.Batch(tiCmd, vpCmd)
+				}
+
+				if strings.HasPrefix(content, "/remove ") {
+					nickname := strings.TrimSpace(strings.TrimPrefix(content, "/remove "))
+					if nickname == "" {
+						m.appendSystem("Usage: /remove <nickname>")
+					} else if err := RemoveContact(nickname); err != nil {
+						m.appendSystem("Error: " + err.Error())
+					} else {
+						delete(m.contacts, strings.ToLower(nickname))
+						if strings.EqualFold(m.peerNick, nickname) {
+							m.peerNick = ""
+						}
+						m.appendSystem(cmdStyle.Render("✓ Contact removed: \"" + nickname + "\""))
+					}
+					m.viewport.SetContent(strings.Join(m.messages, "\n"))
+					m.viewport.GotoBottom()
+					return m, tea.Batch(tiCmd, vpCmd)
+				}
+
+				// ── Regular message — encrypt & send ───────────────────────────
 				plaintext := []byte(content)
 				nonce := make([]byte, m.aead.NonceSize())
 				if _, err := io.ReadFull(rand.Reader, nonce); err == nil {
@@ -342,14 +491,14 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				m.messages = append(m.messages, myMsgStyle.Render("YOU: ")+content)
 				m.viewport.SetContent(strings.Join(m.messages, "\n"))
-				m.textarea.Reset()
 				m.viewport.GotoBottom()
 			}
+
 		case chatMsg:
 			if msg.system {
-				m.messages = append(m.messages, infoStyle.Render(msg.content))
+				m.appendSystem(msg.content)
 			} else {
-				m.messages = append(m.messages, peerMsgStyle.Render("PEER: ")+msg.content)
+				m.messages = append(m.messages, peerMsgStyle.Render(m.peerDisplayName()+": ")+msg.content)
 			}
 			m.viewport.SetContent(strings.Join(m.messages, "\n"))
 			m.viewport.GotoBottom()
@@ -360,38 +509,92 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(tiCmd, vpCmd)
 
+	// ── FATAL ERROR ─────────────────────────────────────────────────────────────
 	case StateFatalError:
-		switch msg := msg.(type) {
-		case tea.KeyMsg:
-			if msg.Type == tea.KeyEsc {
-				if m.t != nil {
-					m.t.Close()
-					m.t = nil
-				}
-				m.state = StateMainMenu
-				return m, nil
+		if msg, ok := msg.(tea.KeyMsg); ok && msg.Type == tea.KeyEsc {
+			if m.t != nil {
+				m.t.Close()
+				m.t = nil
 			}
+			m.state = StateMainMenu
+			return m, nil
 		}
 	}
 
 	return m, nil
 }
 
+// peerDisplayName returns the peer's nickname if known, otherwise their address.
+func (m *uiModel) peerDisplayName() string {
+	if m.peerNick != "" {
+		return m.peerNick
+	}
+	return m.peerAddress + ".onion"
+}
+
+// appendSystem appends a styled system message to the chat log.
+func (m *uiModel) appendSystem(msg string) {
+	m.messages = append(m.messages, infoStyle.Render(msg))
+}
+
 func (m uiModel) View() string {
 	switch m.state {
+
 	case StateMainMenu:
 		return m.list.View()
+
 	case StateInputAddress:
-		return fmt.Sprintf("Enter Target Onion Address:\n\n%s\n\n(esc to cancel)", m.textinput.View())
+		if len(m.contacts) > 0 {
+			contactsBox := m.contactsList.View()
+			inputBox := m.textinput.View()
+
+			var cStyle, iStyle lipgloss.Style
+			if m.joinFocusList {
+				cStyle = focusedStyle
+				iStyle = dimStyle
+			} else {
+				cStyle = dimStyle
+				iStyle = focusedStyle
+			}
+
+			return fmt.Sprintf(
+				"%s\n\n%s\n\n[Tab] to switch focus  •  [Enter] to connect  •  [Esc] back",
+				cStyle.Render(contactsBox),
+				iStyle.Render(inputBox),
+			)
+		}
+		return fmt.Sprintf(
+			"  Enter Target Onion Address\n\n  %s\n\n  [Enter] connect  •  [Esc] back",
+			m.textinput.View(),
+		)
+
 	case StateLoading:
-		return fmt.Sprintf("\n %s %s\n", m.spinner.View(), m.loadingMsg)
+		return fmt.Sprintf("\n  %s %s\n", m.spinner.View(), m.loadingMsg)
+
 	case StatePrompt:
-		return fmt.Sprintf("\n %s\n\n %s", promptStyle.Render("INCOMING CONNECTION FROM: "+m.peerAddress+".onion"), "Accept? (y/n)")
+		peerLabel := m.peerAddress + ".onion"
+		if m.peerNick != "" {
+			peerLabel = m.peerNick + " (" + m.peerAddress + ".onion)"
+		}
+		return fmt.Sprintf(
+			"\n  %s\n\n  Accept? [y/n]",
+			promptStyle.Render("INCOMING CONNECTION FROM: "+peerLabel),
+		)
+
 	case StateChat:
-		header := titleStyle.Render(fmt.Sprintf("Veil Encrypted Chat | %s.onion", m.peerAddress))
+		peerLabel := m.peerAddress + ".onion"
+		if m.peerNick != "" {
+			peerLabel = m.peerNick + " (" + m.peerAddress + ".onion)"
+		}
+		header := titleStyle.Render("Veil  |  " + peerLabel)
 		return fmt.Sprintf("%s\n%s\n\n%s", header, m.viewport.View(), m.textarea.View())
+
 	case StateFatalError:
-		return fmt.Sprintf("\n %s\n %s\n\n (esc to return to menu)", errorStyle.Render("[FATAL ERROR]"), m.fatalError)
+		return fmt.Sprintf(
+			"\n  %s\n  %s\n\n  [Esc] return to menu",
+			errorStyle.Render("[FATAL ERROR]"),
+			m.fatalError,
+		)
 	}
 	return ""
 }
@@ -412,7 +615,6 @@ func startTorCmd(isServer bool) tea.Cmd {
 			},
 		}
 		ctx := context.Background()
-
 		t, err := tor.Start(ctx, torConf)
 		if err != nil {
 			return fatalErrorMsg{err: err, context: "Failed to start Tor daemon"}
@@ -425,7 +627,6 @@ func createOnionCmd(t *tor.Tor, privateKey ed25519.PrivateKey) tea.Cmd {
 	return func() tea.Msg {
 		listenCtx, listenCancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer listenCancel()
-
 		onion, err := t.Listen(listenCtx, &tor.ListenConf{
 			RemotePorts: []int{7777},
 			Key:         privateKey,
@@ -457,28 +658,26 @@ func dialPeerCmd(t *tor.Tor, targetAddress string, privateKey ed25519.PrivateKey
 	return func() tea.Msg {
 		dialCtx, dialCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer dialCancel()
-
 		dialer, err := t.Dialer(dialCtx, nil)
 		if err != nil {
 			return fatalErrorMsg{err: err, context: "Failed to get tor dialer"}
 		}
-
 		conn, err := dialer.DialContext(dialCtx, "tcp", targetAddress+".onion:7777")
 		if err != nil {
 			return fatalErrorMsg{err: err, context: "Connection failed"}
 		}
-
 		peerAddress, aead, err := performHandshake(conn, false, privateKey)
 		if err != nil {
 			conn.Close()
 			return fatalErrorMsg{err: err, context: "Handshake failed"}
 		}
-
 		if peerAddress != targetAddress {
 			conn.Close()
-			return fatalErrorMsg{err: fmt.Errorf("expected %s, got %s", targetAddress, peerAddress), context: "MITM DETECTED!"}
+			return fatalErrorMsg{
+				err:     fmt.Errorf("expected %s, got %s", targetAddress, peerAddress),
+				context: "MITM DETECTED!",
+			}
 		}
-
 		status := make([]byte, 1)
 		if _, err := io.ReadFull(conn, status); err != nil {
 			conn.Close()
@@ -486,9 +685,8 @@ func dialPeerCmd(t *tor.Tor, targetAddress string, privateKey ed25519.PrivateKey
 		}
 		if status[0] == 0x00 {
 			conn.Close()
-			return fatalErrorMsg{err: fmt.Errorf("Connection rejected"), context: "Peer rejected connection"}
+			return fatalErrorMsg{err: fmt.Errorf("connection rejected by peer"), context: "Peer rejected connection"}
 		}
-
 		return connectedMsg{conn: conn, aead: aead, peerAddress: peerAddress}
 	}
 }
@@ -506,26 +704,21 @@ func startReader(conn net.Conn, aead cipher.AEAD) chatStream {
 			if msgLen == 0 {
 				continue
 			}
-
 			cipherText := make([]byte, msgLen)
 			if _, err := io.ReadFull(conn, cipherText); err != nil {
 				ch <- chatMsg{content: "[Failed to read message]", system: true, dropped: true}
 				return
 			}
-
 			if len(cipherText) < aead.NonceSize() {
 				continue
 			}
-
 			nonce := cipherText[:aead.NonceSize()]
 			actualCiphertext := cipherText[aead.NonceSize():]
-
 			plaintext, err := aead.Open(nil, nonce, actualCiphertext, nil)
 			if err != nil {
-				ch <- chatMsg{content: "[Decryption failed - tampering detected?]", system: true}
+				ch <- chatMsg{content: "[Decryption failed — tampering detected?]", system: true}
 				continue
 			}
-
 			ch <- chatMsg{content: string(plaintext), system: false}
 		}
 	}()
@@ -547,16 +740,23 @@ func main() {
 	connectFlag := flag.String("connect", "", "Connect to a peer's onion address")
 	flag.Parse()
 
-	// Step 1: Generate Identity
+	// Generate per-session identity keypair
 	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		fmt.Println("failed to generate keypair:", err)
+		fmt.Println("fatal: failed to generate keypair:", err)
 		os.Exit(1)
 	}
 
-	m := initialModel(privateKey)
+	// Load contacts from disk (non-fatal if missing)
+	contacts, err := LoadContacts()
+	if err != nil {
+		fmt.Println("warning: could not load contacts:", err)
+		contacts = map[string]string{}
+	}
 
-	// Hybrid Fast-Track: if flags were provided, bypass the Main Menu
+	m := initialModel(privateKey, contacts)
+
+	// CLI fast-track: bypass the Main Menu if flags are provided
 	if *listenFlag {
 		m.isServer = true
 		m.state = StateLoading
@@ -570,15 +770,19 @@ func main() {
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
-		fmt.Printf("Error: %v", err)
+		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
+// -------------------------------------------------------------------------------------
+// HELPERS
+// -------------------------------------------------------------------------------------
+
 func extractTor(isListener bool) string {
 	dataDir := torDataDir(isListener)
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
-		return "" // Will crash later on start
+		return ""
 	}
 	exePath := filepath.Join(dataDir, "tor.exe")
 	if _, err := os.Stat(exePath); os.IsNotExist(err) {
@@ -593,13 +797,11 @@ func performHandshake(conn net.Conn, isServer bool, myIdentity ed25519.PrivateKe
 		return "", nil, fmt.Errorf("failed to generate ecdh key: %w", err)
 	}
 	pub := priv.PublicKey().Bytes()
-
 	myEdPub := myIdentity.Public().(ed25519.PublicKey)
 	signature := ed25519.Sign(myIdentity, pub)
 
 	payload := append(pub, myEdPub...)
 	payload = append(payload, signature...)
-
 	peerPayload := make([]byte, 128)
 
 	if isServer {
@@ -625,23 +827,19 @@ func performHandshake(conn net.Conn, isServer bool, myIdentity ed25519.PrivateKe
 	if !ed25519.Verify(ed25519.PublicKey(peerEdPub), peerX25519Pub, peerSig) {
 		return "", nil, fmt.Errorf("invalid identity signature from peer")
 	}
-
 	peerKey, err := ecdh.X25519().NewPublicKey(peerX25519Pub)
 	if err != nil {
 		return "", nil, fmt.Errorf("invalid peer public key: %w", err)
 	}
-
 	secret, err := priv.ECDH(peerKey)
 	if err != nil {
 		return "", nil, fmt.Errorf("ecdh failed: %w", err)
 	}
-
 	hash := sha256.Sum256(secret)
 	aead, err := chacha20poly1305.NewX(hash[:])
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create cipher: %w", err)
 	}
-
 	peerAddress := torutil.OnionServiceIDFromV3PublicKey(torutil_ed25519.PublicKey(peerEdPub))
 	return peerAddress, aead, nil
 }
