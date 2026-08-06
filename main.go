@@ -81,13 +81,15 @@ const (
 	StatePrompt
 	StateChat
 	StateFatalError
+	StateCreatePassphrase
+	StateEnterPassphrase
 )
 
 // -------------------------------------------------------------------------------------
 // LIST ITEM TYPES
 // -------------------------------------------------------------------------------------
 
-// menuItem is used for the main menu.
+// List Item
 type menuItem string
 
 func (i menuItem) Title() string       { return string(i) }
@@ -152,8 +154,15 @@ type uiModel struct {
 	chatSub     chatStream
 
 	// Contacts
-	contacts        map[string]string // name → address
-	joinFocusList   bool              // true = navigating contacts, false = typing address
+	contacts      map[string]string // name → address
+	joinFocusList bool              // true = navigating contacts, false = typing address
+
+	// Passphrase state
+	passphraseInput textinput.Model
+	confirmMode     bool
+	tempPassphrase  string
+	passphraseErr   string
+	burnerMode      bool
 
 	// UI Components
 	list         list.Model
@@ -169,7 +178,7 @@ type uiModel struct {
 	windowHeight int
 }
 
-func initialModel(privateKey ed25519.PrivateKey, contacts map[string]string) uiModel {
+func initialModel(contacts map[string]string) uiModel {
 	// Main Menu
 	items := []list.Item{menuItem("Host a Chat (Listen)"), menuItem("Join a Chat (Connect)")}
 	l := list.New(items, list.NewDefaultDelegate(), 0, 0)
@@ -190,6 +199,14 @@ func initialModel(privateKey ed25519.PrivateKey, contacts map[string]string) uiM
 	ti.CharLimit = 156
 	ti.Width = 60
 
+	// Passphrase Input
+	pi := textinput.New()
+	pi.Placeholder = "Password"
+	pi.Focus()
+	pi.EchoMode = textinput.EchoPassword
+	pi.EchoCharacter = '*'
+	pi.Width = 40
+
 	// Spinner
 	s := spinner.New()
 	s.Spinner = spinner.Dot
@@ -209,16 +226,16 @@ func initialModel(privateKey ed25519.PrivateKey, contacts map[string]string) uiM
 	vp := viewport.New(80, 20)
 
 	return uiModel{
-		state:        StateMainMenu,
-		myIdentity:   privateKey,
-		contacts:     contacts,
-		list:         l,
-		contactsList: cl,
-		spinner:      s,
-		textinput:    ti,
-		textarea:     ta,
-		viewport:     vp,
-		messages:     []string{},
+		state:           StateMainMenu,
+		contacts:        contacts,
+		passphraseInput: pi,
+		list:            l,
+		contactsList:    cl,
+		spinner:         s,
+		textinput:       ti,
+		textarea:        ta,
+		viewport:        vp,
+		messages:        []string{},
 	}
 }
 
@@ -245,6 +262,9 @@ func buildContactsList(contacts map[string]string, w, h int) list.Model {
 func (m uiModel) Init() tea.Cmd {
 	if m.state == StateLoading {
 		return tea.Batch(m.spinner.Tick, startTorCmd(m.isServer))
+	}
+	if m.state == StateCreatePassphrase || m.state == StateEnterPassphrase {
+		return textinput.Blink
 	}
 	return nil
 }
@@ -283,7 +303,105 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// State-machine updates
 	switch m.state {
 
-	// ── MAIN MENU ──────────────────────────────────────────────────────────────
+	case StateCreatePassphrase:
+		var cmd tea.Cmd
+		m.passphraseInput, cmd = m.passphraseInput.Update(msg)
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			if msg.Type == tea.KeyEnter {
+				val := m.passphraseInput.Value()
+				m.passphraseInput.SetValue("")
+				if val == "" {
+					return m, nil
+				}
+				if !m.confirmMode {
+					m.tempPassphrase = val
+					m.confirmMode = true
+					m.passphraseInput.Placeholder = "Confirm Password"
+					m.passphraseErr = ""
+					return m, nil
+				} else {
+					if val == m.tempPassphrase {
+						_, priv, err := ed25519.GenerateKey(rand.Reader)
+						if err != nil {
+							m.state = StateFatalError
+							m.fatalError = "Failed to generate identity: " + err.Error()
+							return m, nil
+						}
+						encrypted, err := encryptIdentity(priv, val)
+						if err != nil {
+							m.state = StateFatalError
+							m.fatalError = "Failed to encrypt identity: " + err.Error()
+							return m, nil
+						}
+						keyPath := identityKeyPath()
+						if err := os.MkdirAll(filepath.Dir(keyPath), 0700); err != nil {
+							m.state = StateFatalError
+							m.fatalError = "Failed to create config dir: " + err.Error()
+							return m, nil
+						}
+						if err := os.WriteFile(keyPath, encrypted, 0600); err != nil {
+							m.state = StateFatalError
+							m.fatalError = "Failed to save identity: " + err.Error()
+							return m, nil
+						}
+						m.myIdentity = priv
+						m.confirmMode = false
+						m.tempPassphrase = ""
+						m.passphraseErr = ""
+						if m.isServer || m.peerAddress != "" {
+							m.state = StateLoading
+							return m, tea.Batch(m.spinner.Tick, startTorCmd(m.isServer))
+						}
+						m.state = StateMainMenu
+						return m, nil
+					} else {
+						m.passphraseErr = "Passwords do not match. Try again."
+						m.confirmMode = false
+						m.tempPassphrase = ""
+						m.passphraseInput.Placeholder = "Password"
+						return m, nil
+					}
+				}
+			}
+		}
+		return m, cmd
+
+	case StateEnterPassphrase:
+		var cmd tea.Cmd
+		m.passphraseInput, cmd = m.passphraseInput.Update(msg)
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			if msg.Type == tea.KeyEnter {
+				val := m.passphraseInput.Value()
+				m.passphraseInput.SetValue("")
+				if val == "" {
+					return m, nil
+				}
+				keyPath := identityKeyPath()
+				encryptedData, err := os.ReadFile(keyPath)
+				if err != nil {
+					m.state = StateFatalError
+					m.fatalError = "Failed to read identity: " + err.Error()
+					return m, nil
+				}
+				priv, err := decryptIdentity(encryptedData, val)
+				if err != nil {
+					m.passphraseErr = "Incorrect passphrase. Please try again."
+					return m, nil
+				}
+				m.myIdentity = priv
+				m.passphraseErr = ""
+				if m.isServer || m.peerAddress != "" {
+					m.state = StateLoading
+					return m, tea.Batch(m.spinner.Tick, startTorCmd(m.isServer))
+				}
+				m.state = StateMainMenu
+				return m, nil
+			}
+		}
+		return m, cmd
+
 	case StateMainMenu:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -529,7 +647,7 @@ func (m *uiModel) peerDisplayName() string {
 	if m.peerNick != "" {
 		return m.peerNick
 	}
-	return m.peerAddress + ".onion"
+	return "PEER"
 }
 
 // appendSystem appends a styled system message to the chat log.
@@ -539,6 +657,24 @@ func (m *uiModel) appendSystem(msg string) {
 
 func (m uiModel) View() string {
 	switch m.state {
+
+	case StateCreatePassphrase:
+		prompt := "Create a master passphrase to secure your local identity:"
+		if m.confirmMode {
+			prompt = "Confirm master passphrase:"
+		}
+		errStr := ""
+		if m.passphraseErr != "" {
+			errStr = "\n  " + errorStyle.Render(m.passphraseErr) + "\n"
+		}
+		return fmt.Sprintf("\n  %s\n\n  %s\n%s", prompt, m.passphraseInput.View(), errStr)
+
+	case StateEnterPassphrase:
+		errStr := ""
+		if m.passphraseErr != "" {
+			errStr = "\n  " + errorStyle.Render(m.passphraseErr) + "\n"
+		}
+		return fmt.Sprintf("\n  Enter master passphrase to unlock your identity:\n\n  %s\n%s", m.passphraseInput.View(), errStr)
 
 	case StateMainMenu:
 		return m.list.View()
@@ -738,14 +874,8 @@ func waitForChatMsg(sub chatStream) tea.Cmd {
 func main() {
 	listenFlag := flag.Bool("listen", false, "Listen for incoming connections")
 	connectFlag := flag.String("connect", "", "Connect to a peer's onion address")
+	burnerMode := flag.Bool("burner-mode", false, "Run in burner mode (random temporary identity)")
 	flag.Parse()
-
-	// Generate per-session identity keypair
-	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		fmt.Println("fatal: failed to generate keypair:", err)
-		os.Exit(1)
-	}
 
 	// Load contacts from disk (non-fatal if missing)
 	contacts, err := LoadContacts()
@@ -754,7 +884,7 @@ func main() {
 		contacts = map[string]string{}
 	}
 
-	m := initialModel(privateKey, contacts)
+	m := initialModel(contacts)
 
 	// CLI fast-track: bypass the Main Menu if flags are provided
 	if *listenFlag {
@@ -766,6 +896,29 @@ func main() {
 		m.peerAddress = strings.TrimSuffix(*connectFlag, ".onion")
 		m.state = StateLoading
 		m.loadingMsg = "Starting Tor daemon (may take 30-60s)..."
+	}
+
+	if *burnerMode {
+		m.burnerMode = true
+		// Generate random temporary identity keypair immediately
+		_, privKey, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			fmt.Println("fatal: failed to generate burner keypair:", err)
+			os.Exit(1)
+		}
+		m.myIdentity = privKey
+		// Bypasses passphrase states, go directly to MainMenu (or StateLoading if CLI flags are active)
+		if !*listenFlag && *connectFlag == "" {
+			m.state = StateMainMenu
+		}
+	} else {
+		// Standard mode: check if identity.key exists
+		keyPath := identityKeyPath()
+		if _, err := os.Stat(keyPath); os.IsNotExist(err) {
+			m.state = StateCreatePassphrase
+		} else {
+			m.state = StateEnterPassphrase
+		}
 	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
@@ -842,6 +995,14 @@ func performHandshake(conn net.Conn, isServer bool, myIdentity ed25519.PrivateKe
 	}
 	peerAddress := torutil.OnionServiceIDFromV3PublicKey(torutil_ed25519.PublicKey(peerEdPub))
 	return peerAddress, aead, nil
+}
+
+func identityKeyPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".veil-identity.key"
+	}
+	return filepath.Join(home, ".veil", "identity.key")
 }
 
 func torDataDir(isListener bool) string {
