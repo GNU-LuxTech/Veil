@@ -211,6 +211,7 @@ and **intellectual property protection** (required for sustainability).
 - [ ] `--auto-accept` whitelist for trusted addresses
 - [ ] Session transcript opt-in (encrypted, local only)
 - [ ] Multi-platform builds (Linux, macOS, Windows, Android via Termux)
+- [ ] `--help` flag with styled usage output
 
 ### Phase 4 — Hardening
 
