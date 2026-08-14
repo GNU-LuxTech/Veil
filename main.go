@@ -199,6 +199,7 @@ type uiModel struct {
 	tempPassphrase  string
 	passphraseErr   string
 	burnerMode      bool
+	autoAccept      bool
 
 	// File transfer state
 	pendingOffer    *FileOfferPayload
@@ -541,6 +542,14 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.aead = msg.aead
 			m.peerAddress = msg.peerAddress
 			m.peerNick = LookupNickname(m.contacts, msg.peerAddress)
+			if m.autoAccept && m.peerNick != "" {
+				m.conn.Write([]byte{0x01})
+				m.state = StateChat
+				m.messages = []string{}
+				m.viewport.SetContent(infoStyle.Render("Auto-accepted connection from " + m.peerDisplayName() + "."))
+				m.chatSub = startReader(m.conn, m.aead)
+				return m, tea.Batch(cmd, waitForChatMsg(m.chatSub), textarea.Blink)
+			}
 			m.state = StatePrompt
 			return m, cmd
 
@@ -748,8 +757,34 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case chatMsg:
 			if msg.fileOffer != nil {
-				m.pendingOffer = msg.fileOffer
-				m.appendSystem(promptStyle.Render(fmt.Sprintf("Incoming file offer: \"%s\" (%s). Type /accept or /reject.", msg.fileOffer.Name, formatSize(msg.fileOffer.Size))))
+				if m.autoAccept && m.peerNick != "" {
+					home, _ := os.UserHomeDir()
+					destDir := filepath.Join(home, "Downloads")
+					os.MkdirAll(destDir, 0755)
+					destPath := filepath.Join(destDir, msg.fileOffer.Name)
+
+					f, err := os.Create(destPath)
+					if err == nil {
+						m.activeTransfer = &TransferState{
+							FileName:    msg.fileOffer.Name,
+							TotalSize:   msg.fileOffer.Size,
+							Transferred: 0,
+							StartTime:   time.Now(),
+							IsSending:   false,
+							OutputFile:  f,
+						}
+						sendFrame(m.conn, m.aead, MsgTypeFileResponse, []byte{0x01})
+						m.appendSystem(cmdStyle.Render(fmt.Sprintf("Auto-accepted file \"%s\". Receiving...", msg.fileOffer.Name)))
+						progressLine := renderProgressBar(0, msg.fileOffer.Size, time.Now(), false)
+						m.messages = append(m.messages, progressLine)
+						m.activeTransfer.ProgressMsgIdx = len(m.messages) - 1
+					} else {
+						m.appendSystem("Error creating file: " + err.Error())
+					}
+				} else {
+					m.pendingOffer = msg.fileOffer
+					m.appendSystem(promptStyle.Render(fmt.Sprintf("Incoming file offer: \"%s\" (%s). Type /accept or /reject.", msg.fileOffer.Name, formatSize(msg.fileOffer.Size))))
+				}
 			} else if msg.fileResponse != nil {
 				if *msg.fileResponse {
 					if m.sendingFilePath != "" {
@@ -1232,6 +1267,7 @@ func main() {
 	listenFlag := flag.Bool("listen", false, "Listen for incoming connections")
 	connectFlag := flag.String("connect", "", "Connect to a peer's onion address")
 	burnerMode := flag.Bool("burner-mode", false, "Run in burner mode (random temporary identity)")
+	autoAccept := flag.Bool("auto-accept", false, "Auto-accept connections and file transfers from saved contacts")
 
 	flag.Usage = func() {
 		banner := titleStyle.Render(" Veil — Ephemeral Encrypted P2P Messenger ")
@@ -1242,6 +1278,7 @@ func main() {
 		fmt.Println("  --listen               Start Veil in host/listener mode")
 		fmt.Println("  --connect <address>    Connect directly to a peer's .onion address")
 		fmt.Println("  --burner-mode          Run with a throwaway keypair (no disk persistence)")
+		fmt.Println("  --auto-accept          Auto-accept connections & files from contacts")
 		fmt.Println("  --help, -h             Show this help menu\n")
 		fmt.Println(infoStyle.Render("IN-CHAT COMMANDS:"))
 		fmt.Println("  /add <name>            Save current peer to contacts")
@@ -1261,6 +1298,7 @@ func main() {
 	}
 
 	m := initialModel(contacts)
+	m.autoAccept = *autoAccept
 
 	// CLI fast-track: bypass the Main Menu if flags are provided
 	if *listenFlag {
@@ -1268,6 +1306,11 @@ func main() {
 		m.state = StateLoading
 		m.loadingMsg = "Starting Tor daemon (may take 30-60s)..."
 	} else if *connectFlag != "" {
+		if strings.HasPrefix(*connectFlag, "-") {
+			fmt.Println("Error: --connect requires a target .onion address.")
+			fmt.Println("Correct order: veil --auto-accept --connect <address>  OR  veil --connect <address> --auto-accept")
+			os.Exit(1)
+		}
 		m.isServer = false
 		m.peerAddress = strings.TrimSuffix(*connectFlag, ".onion")
 		m.state = StateLoading
