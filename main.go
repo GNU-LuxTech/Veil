@@ -190,8 +190,11 @@ type uiModel struct {
 	chatSub     chatStream
 
 	// Contacts
-	contacts      map[string]string // name → address
-	joinFocusList bool              // true = navigating contacts, false = typing address
+	contacts          map[string]string // name → address
+	joinFocusList     bool              // true = navigating contacts, false = typing address
+	joinSavingContact bool
+	joinNickInput     textinput.Model
+	joinStatusMsg     string
 
 	// Passphrase state
 	passphraseInput textinput.Model
@@ -268,6 +271,12 @@ func initialModel(contacts map[string]string) uiModel {
 
 	vp := viewport.New(80, 20)
 
+	// Nickname Input (for saving contacts from Join screen)
+	ni := textinput.New()
+	ni.Placeholder = "Enter nickname..."
+	ni.CharLimit = 32
+	ni.Width = 40
+
 	return uiModel{
 		state:           StateMainMenu,
 		contacts:        contacts,
@@ -276,6 +285,7 @@ func initialModel(contacts map[string]string) uiModel {
 		contactsList:    cl,
 		spinner:         s,
 		textinput:       ti,
+		joinNickInput:   ni,
 		textarea:        ta,
 		viewport:        vp,
 		messages:        []string{},
@@ -479,14 +489,54 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case StateInputAddress:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
+			// ── Nickname sub-prompt (Ctrl+S flow) ─────────────────────────
+			if m.joinSavingContact {
+				switch msg.Type {
+				case tea.KeyEsc:
+					m.joinSavingContact = false
+					m.joinNickInput.SetValue("")
+					m.joinStatusMsg = ""
+					return m, nil
+				case tea.KeyEnter:
+					nick := strings.TrimSpace(m.joinNickInput.Value())
+					addr := strings.TrimSuffix(strings.TrimSpace(m.textinput.Value()), ".onion")
+					if nick == "" {
+						m.joinStatusMsg = "Nickname cannot be empty."
+					} else if addr == "" {
+						m.joinStatusMsg = "Address cannot be empty."
+					} else if err := AddContact(nick, addr); err != nil {
+						m.joinStatusMsg = "Error: " + err.Error()
+					} else {
+						m.contacts[strings.ToLower(nick)] = addr
+						contactsH := m.windowHeight/2 - 4
+						if contactsH < 3 {
+							contactsH = 3
+						}
+						m.contactsList = buildContactsList(m.contacts, m.windowWidth-4, contactsH)
+						m.joinSavingContact = false
+						m.joinNickInput.SetValue("")
+						m.textinput.SetValue("")
+						m.joinFocusList = true
+						m.joinStatusMsg = cmdStyle.Render("✓ Saved contact: \"" + nick + "\" → " + addr + ".onion")
+					}
+					return m, nil
+				default:
+					var cmd tea.Cmd
+					m.joinNickInput, cmd = m.joinNickInput.Update(msg)
+					return m, cmd
+				}
+			}
+
 			switch msg.Type {
 			case tea.KeyEsc:
 				m.state = StateMainMenu
+				m.joinStatusMsg = ""
 				return m, nil
 
 			case tea.KeyTab:
 				if len(m.contacts) > 0 {
 					m.joinFocusList = !m.joinFocusList
+					m.joinStatusMsg = ""
 					return m, nil
 				}
 
@@ -504,6 +554,41 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.state = StateLoading
 					m.loadingMsg = "Starting Tor daemon (may take 30-60s)..."
 					return m, tea.Batch(m.spinner.Tick, startTorCmd(false))
+				}
+
+			default:
+				// Ctrl+D — delete selected contact (list must be focused)
+				if msg.String() == "ctrl+d" && m.joinFocusList {
+					if item, ok := m.contactsList.SelectedItem().(contactItem); ok {
+						if err := RemoveContact(item.name); err != nil {
+							m.joinStatusMsg = "Error: " + err.Error()
+						} else {
+							delete(m.contacts, strings.ToLower(item.name))
+							contactsH := m.windowHeight/2 - 4
+							if contactsH < 3 {
+								contactsH = 3
+							}
+							m.contactsList = buildContactsList(m.contacts, m.windowWidth-4, contactsH)
+							if len(m.contacts) == 0 {
+								m.joinFocusList = false
+							}
+							m.joinStatusMsg = cmdStyle.Render("✓ Deleted contact \"" + item.name + "\"")
+						}
+					}
+					return m, nil
+				}
+				// Ctrl+S — save address as contact (input must be focused)
+				if msg.String() == "ctrl+s" && !m.joinFocusList {
+					addr := strings.TrimSuffix(strings.TrimSpace(m.textinput.Value()), ".onion")
+					if addr == "" {
+						m.joinStatusMsg = "Paste an address first."
+					} else {
+						m.joinSavingContact = true
+						m.joinNickInput.SetValue("")
+						m.joinNickInput.Focus()
+						m.joinStatusMsg = ""
+					}
+					return m, textinput.Blink
 				}
 			}
 		}
@@ -914,28 +999,48 @@ func (m uiModel) View() string {
 		return m.list.View()
 
 	case StateInputAddress:
+		statusLine := ""
+		if m.joinStatusMsg != "" {
+			statusLine = "\n  " + m.joinStatusMsg
+		}
+
+		// Nickname sub-prompt overlay
+		if m.joinSavingContact {
+			addr := strings.TrimSuffix(strings.TrimSpace(m.textinput.Value()), ".onion")
+			return fmt.Sprintf(
+				"  Save contact\n  Address: %s.onion\n\n  Nickname: %s\n\n  [Enter] save  •  [Esc] cancel",
+				addr, m.joinNickInput.View(),
+			)
+		}
+
 		if len(m.contacts) > 0 {
 			contactsBox := m.contactsList.View()
 			inputBox := m.textinput.View()
 
 			var cStyle, iStyle lipgloss.Style
+			var footer string
 			if m.joinFocusList {
 				cStyle = focusedStyle
 				iStyle = dimStyle
+				footer = "[Tab] switch  •  [Enter] connect  •  [Ctrl+D] delete contact  •  [Esc] back"
 			} else {
 				cStyle = dimStyle
 				iStyle = focusedStyle
+				footer = "[Tab] switch  •  [Enter] connect  •  [Ctrl+S] save as contact  •  [Esc] back"
 			}
 
 			return fmt.Sprintf(
-				"%s\n\n%s\n\n[Tab] to switch focus  •  [Enter] to connect  •  [Esc] back",
+				"%s\n\n%s\n\n%s%s",
 				cStyle.Render(contactsBox),
 				iStyle.Render(inputBox),
+				footer,
+				statusLine,
 			)
 		}
 		return fmt.Sprintf(
-			"  Enter Target Onion Address\n\n  %s\n\n  [Enter] connect  •  [Esc] back",
+			"  Enter Target Onion Address\n\n  %s\n\n  [Enter] connect  •  [Ctrl+S] save as contact  •  [Esc] back%s",
 			m.textinput.View(),
+			statusLine,
 		)
 
 	case StateLoading:
