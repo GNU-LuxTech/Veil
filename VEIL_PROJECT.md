@@ -210,7 +210,6 @@ and **intellectual property protection** (required for sustainability).
 - [x] Contact alias system (local nickname → onion address mapping)
 - [ ] `--auto-accept` whitelist for trusted addresses
 - [ ] Session transcript opt-in (encrypted, local only)
-- [ ] Multi-platform builds (Linux, macOS, Windows, Android via Termux)
 - [x] `--help` flag with styled usage output
 
 ### Phase 4 — Hardening
@@ -218,6 +217,10 @@ and **intellectual property protection** (required for sustainability).
 - [ ] Traffic padding (resist timing analysis)
 - [ ] Canary mode (detect if binary has been tampered)
 - [ ] External security audit
+
+### Phase 5 — Last touches
+
+- [ ] Multi-platform builds (Linux, macOS, Windows, Android via Termux)
 - [ ] Source-available public release
 
 ---
