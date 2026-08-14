@@ -26,9 +26,11 @@ import (
 	"crypto/sha256"
 	_ "embed"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -106,6 +108,37 @@ func (i contactItem) Title() string       { return i.name }
 func (i contactItem) Description() string { return i.address + ".onion" }
 func (i contactItem) FilterValue() string { return i.name }
 
+// Message type headers
+const (
+	MsgTypeChat         byte = 0x00
+	MsgTypeFileOffer    byte = 0x01
+	MsgTypeFileResponse byte = 0x02
+	MsgTypeFileChunk    byte = 0x03
+)
+
+type FileOfferPayload struct {
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
+
+type TransferState struct {
+	FileName       string
+	TotalSize      int64
+	Transferred    int64
+	StartTime      time.Time
+	IsSending      bool
+	OutputFile     *os.File
+	ProgressMsgIdx int
+}
+
+type fileProgressMsg struct {
+	transferred int64
+	total       int64
+	isSending   bool
+	done        bool
+	err         error
+}
+
 // -------------------------------------------------------------------------------------
 // ASYNC MESSAGES
 // -------------------------------------------------------------------------------------
@@ -127,9 +160,12 @@ type fatalErrorMsg struct {
 	context string
 }
 type chatMsg struct {
-	content string
-	system  bool
-	dropped bool
+	content      string
+	system       bool
+	dropped      bool
+	fileOffer    *FileOfferPayload
+	fileResponse *bool
+	fileChunk    []byte
 }
 type chatStream struct {
 	ch <-chan chatMsg
@@ -163,6 +199,12 @@ type uiModel struct {
 	tempPassphrase  string
 	passphraseErr   string
 	burnerMode      bool
+
+	// File transfer state
+	pendingOffer    *FileOfferPayload
+	sendingFilePath string
+	activeTransfer  *TransferState
+	progressSub     chan fileProgressMsg
 
 	// UI Components
 	list         list.Model
@@ -595,25 +637,168 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Batch(tiCmd, vpCmd)
 				}
 
-				// ── Regular message — encrypt & send ───────────────────────────
-				plaintext := []byte(content)
-				nonce := make([]byte, m.aead.NonceSize())
-				if _, err := io.ReadFull(rand.Reader, nonce); err == nil {
-					ciphertext := m.aead.Seal(nil, nonce, plaintext, nil)
-					frame := append(nonce, ciphertext...)
-					lenBuf := make([]byte, 2)
-					binary.BigEndian.PutUint16(lenBuf, uint16(len(frame)))
-					m.conn.Write(lenBuf)
-					m.conn.Write(frame)
+				if strings.HasPrefix(content, "/send ") {
+					filePath := strings.TrimSpace(strings.TrimPrefix(content, "/send "))
+					filePath = strings.Trim(filePath, "\"'")
+					if filePath == "" {
+						m.appendSystem("Usage: /send <file_path>")
+					} else if info, err := os.Stat(filePath); err != nil {
+						m.appendSystem("Error: file not found or inaccessible: " + err.Error())
+					} else if info.IsDir() {
+						m.appendSystem("Error: specified path is a directory, not a file.")
+					} else {
+						m.sendingFilePath = filePath
+						offer := FileOfferPayload{
+							Name: filepath.Base(filePath),
+							Size: info.Size(),
+						}
+						payload, _ := json.Marshal(offer)
+						if err := sendFrame(m.conn, m.aead, MsgTypeFileOffer, payload); err != nil {
+							m.appendSystem("Failed to send file offer: " + err.Error())
+						} else {
+							m.appendSystem(cmdStyle.Render(fmt.Sprintf("Sent file offer: \"%s\" (%s). Waiting for peer...", offer.Name, formatSize(offer.Size))))
+						}
+					}
+					m.viewport.SetContent(strings.Join(m.messages, "\n"))
+					m.viewport.GotoBottom()
+					return m, tea.Batch(tiCmd, vpCmd)
 				}
 
-				m.messages = append(m.messages, myMsgStyle.Render("YOU: ")+content)
+				if content == "/accept" {
+					if m.pendingOffer == nil {
+						m.appendSystem("No pending file offer to accept.")
+					} else {
+						home, _ := os.UserHomeDir()
+						destDir := filepath.Join(home, "Downloads")
+						os.MkdirAll(destDir, 0755)
+						destPath := filepath.Join(destDir, m.pendingOffer.Name)
+
+						f, err := os.Create(destPath)
+						if err != nil {
+							m.appendSystem("Error creating destination file: " + err.Error())
+						} else {
+							m.activeTransfer = &TransferState{
+								FileName:    m.pendingOffer.Name,
+								TotalSize:   m.pendingOffer.Size,
+								Transferred: 0,
+								StartTime:   time.Now(),
+								IsSending:   false,
+								OutputFile:  f,
+							}
+							sendFrame(m.conn, m.aead, MsgTypeFileResponse, []byte{0x01})
+							m.appendSystem(cmdStyle.Render(fmt.Sprintf("Accepted file \"%s\". Receiving...", m.pendingOffer.Name)))
+							progressLine := renderProgressBar(0, m.pendingOffer.Size, time.Now(), false)
+							m.messages = append(m.messages, progressLine)
+							m.activeTransfer.ProgressMsgIdx = len(m.messages) - 1
+							m.pendingOffer = nil
+						}
+					}
+					m.viewport.SetContent(strings.Join(m.messages, "\n"))
+					m.viewport.GotoBottom()
+					return m, tea.Batch(tiCmd, vpCmd)
+				}
+
+				if content == "/reject" {
+					if m.pendingOffer == nil {
+						m.appendSystem("No pending file offer to reject.")
+					} else {
+						sendFrame(m.conn, m.aead, MsgTypeFileResponse, []byte{0x00})
+						m.appendSystem(cmdStyle.Render(fmt.Sprintf("Rejected file offer for \"%s\".", m.pendingOffer.Name)))
+						m.pendingOffer = nil
+					}
+					m.viewport.SetContent(strings.Join(m.messages, "\n"))
+					m.viewport.GotoBottom()
+					return m, tea.Batch(tiCmd, vpCmd)
+				}
+
+				// ── Regular message — encrypt & send ───────────────────────────
+				if err := sendFrame(m.conn, m.aead, MsgTypeChat, []byte(content)); err != nil {
+					m.appendSystem("Failed to send message: " + err.Error())
+				} else {
+					m.messages = append(m.messages, myMsgStyle.Render("YOU: ")+content)
+				}
 				m.viewport.SetContent(strings.Join(m.messages, "\n"))
 				m.viewport.GotoBottom()
 			}
 
+		case fileProgressMsg:
+			if m.activeTransfer != nil && m.activeTransfer.IsSending {
+				if msg.err != nil {
+					m.appendSystem("File upload error: " + msg.err.Error())
+					m.activeTransfer = nil
+				} else {
+					m.activeTransfer.Transferred = msg.transferred
+					pLine := renderProgressBar(msg.transferred, msg.total, m.activeTransfer.StartTime, true)
+					if m.activeTransfer.ProgressMsgIdx < len(m.messages) {
+						m.messages[m.activeTransfer.ProgressMsgIdx] = pLine
+					}
+					if msg.done {
+						m.messages[m.activeTransfer.ProgressMsgIdx] = cmdStyle.Render(fmt.Sprintf("✓ File transfer complete: \"%s\" sent successfully.", m.activeTransfer.FileName))
+						m.activeTransfer = nil
+					} else {
+						m.viewport.SetContent(strings.Join(m.messages, "\n"))
+						m.viewport.GotoBottom()
+						return m, tea.Batch(tiCmd, vpCmd, waitForProgressMsg(m.progressSub))
+					}
+				}
+			}
+			m.viewport.SetContent(strings.Join(m.messages, "\n"))
+			m.viewport.GotoBottom()
+			return m, tea.Batch(tiCmd, vpCmd)
+
 		case chatMsg:
-			if msg.system {
+			if msg.fileOffer != nil {
+				m.pendingOffer = msg.fileOffer
+				m.appendSystem(promptStyle.Render(fmt.Sprintf("Incoming file offer: \"%s\" (%s). Type /accept or /reject.", msg.fileOffer.Name, formatSize(msg.fileOffer.Size))))
+			} else if msg.fileResponse != nil {
+				if *msg.fileResponse {
+					if m.sendingFilePath != "" {
+						info, err := os.Stat(m.sendingFilePath)
+						if err == nil {
+							m.activeTransfer = &TransferState{
+								FileName:    filepath.Base(m.sendingFilePath),
+								TotalSize:   info.Size(),
+								Transferred: 0,
+								StartTime:   time.Now(),
+								IsSending:   true,
+							}
+							m.appendSystem(cmdStyle.Render(fmt.Sprintf("Peer accepted \"%s\". Starting upload...", m.activeTransfer.FileName)))
+							pLine := renderProgressBar(0, info.Size(), time.Now(), true)
+							m.messages = append(m.messages, pLine)
+							m.activeTransfer.ProgressMsgIdx = len(m.messages) - 1
+							m.progressSub = make(chan fileProgressMsg, 100)
+							sendCmd := sendFileChunksCmd(m.conn, m.aead, m.sendingFilePath, m.progressSub)
+							m.viewport.SetContent(strings.Join(m.messages, "\n"))
+							m.viewport.GotoBottom()
+							return m, tea.Batch(tiCmd, vpCmd, sendCmd, waitForChatMsg(m.chatSub))
+						}
+					}
+				} else {
+					m.appendSystem(infoStyle.Render("Peer rejected file offer."))
+					m.sendingFilePath = ""
+				}
+			} else if msg.fileChunk != nil {
+				if m.activeTransfer != nil && !m.activeTransfer.IsSending && m.activeTransfer.OutputFile != nil {
+					n, err := m.activeTransfer.OutputFile.Write(msg.fileChunk)
+					if err != nil {
+						m.appendSystem("File write error: " + err.Error())
+						m.activeTransfer.OutputFile.Close()
+						m.activeTransfer = nil
+					} else {
+						m.activeTransfer.Transferred += int64(n)
+						pLine := renderProgressBar(m.activeTransfer.Transferred, m.activeTransfer.TotalSize, m.activeTransfer.StartTime, false)
+						if m.activeTransfer.ProgressMsgIdx < len(m.messages) {
+							m.messages[m.activeTransfer.ProgressMsgIdx] = pLine
+						}
+						if m.activeTransfer.Transferred >= m.activeTransfer.TotalSize {
+							destPath := m.activeTransfer.OutputFile.Name()
+							m.activeTransfer.OutputFile.Close()
+							m.messages[m.activeTransfer.ProgressMsgIdx] = cmdStyle.Render(fmt.Sprintf("✓ File received: \"%s\" saved to %s", m.activeTransfer.FileName, destPath))
+							m.activeTransfer = nil
+						}
+					}
+				}
+			} else if msg.system {
 				m.appendSystem(msg.content)
 			} else {
 				m.messages = append(m.messages, peerMsgStyle.Render(m.peerDisplayName()+": ")+msg.content)
@@ -827,6 +1012,153 @@ func dialPeerCmd(t *tor.Tor, targetAddress string, privateKey ed25519.PrivateKey
 	}
 }
 
+func sendFrame(conn net.Conn, aead cipher.AEAD, msgType byte, payload []byte) error {
+	plaintext := make([]byte, 1+len(payload))
+	plaintext[0] = msgType
+	copy(plaintext[1:], payload)
+
+	nonce := make([]byte, aead.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return err
+	}
+	ciphertext := aead.Seal(nil, nonce, plaintext, nil)
+	frame := append(nonce, ciphertext...)
+	lenBuf := make([]byte, 2)
+	binary.BigEndian.PutUint16(lenBuf, uint16(len(frame)))
+	if _, err := conn.Write(lenBuf); err != nil {
+		return err
+	}
+	if _, err := conn.Write(frame); err != nil {
+		return err
+	}
+	return nil
+}
+
+func formatSize(bytes int64) string {
+	const (
+		KB = 1024
+		MB = 1024 * KB
+		GB = 1024 * MB
+	)
+	switch {
+	case bytes >= GB:
+		return fmt.Sprintf("%.2f GB", float64(bytes)/float64(GB))
+	case bytes >= MB:
+		return fmt.Sprintf("%.2f MB", float64(bytes)/float64(MB))
+	case bytes >= KB:
+		return fmt.Sprintf("%.1f KB", float64(bytes)/float64(KB))
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
+}
+
+func renderProgressBar(transferred, total int64, startTime time.Time, isSending bool) string {
+	if total <= 0 {
+		total = 1
+	}
+	if transferred < 0 {
+		transferred = 0
+	}
+
+	pct := float64(transferred) / float64(total) * 100.0
+	if math.IsNaN(pct) || pct < 0.0 {
+		pct = 0.0
+	}
+	if pct > 100.0 {
+		pct = 100.0
+	}
+
+	barLen := 20
+	filled := int(pct / 100.0 * float64(barLen))
+	if filled < 0 {
+		filled = 0
+	}
+	if filled > barLen {
+		filled = barLen
+	}
+
+	unfilled := barLen - filled
+	if unfilled < 0 {
+		unfilled = 0
+	}
+
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", unfilled)
+
+	elapsed := time.Since(startTime).Seconds()
+	var speed float64
+	if elapsed > 0 {
+		speed = float64(transferred) / elapsed
+	}
+
+	remainingBytes := total - transferred
+	if remainingBytes < 0 {
+		remainingBytes = 0
+	}
+
+	var etaSec int
+	if speed > 0 && remainingBytes > 0 {
+		etaSec = int(float64(remainingBytes) / speed)
+	}
+
+	direction := "Downloading"
+	if isSending {
+		direction = "Uploading"
+	}
+
+	return fmt.Sprintf("┃ [%s] %5.1f%% | %s / %s | %s/s | ETA %02d:%02d (%s)",
+		bar, pct, formatSize(transferred), formatSize(total), formatSize(int64(speed)), etaSec/60, etaSec%60, direction)
+}
+
+func sendFileChunksCmd(conn net.Conn, aead cipher.AEAD, filePath string, ch chan fileProgressMsg) tea.Cmd {
+	go func() {
+		f, err := os.Open(filePath)
+		if err != nil {
+			ch <- fileProgressMsg{err: err}
+			return
+		}
+		defer f.Close()
+
+		info, err := f.Stat()
+		if err != nil {
+			ch <- fileProgressMsg{err: err}
+			return
+		}
+
+		total := info.Size()
+		buf := make([]byte, 32768)
+		var sent int64
+
+		for {
+			n, readErr := f.Read(buf)
+			if n > 0 {
+				if err := sendFrame(conn, aead, MsgTypeFileChunk, buf[:n]); err != nil {
+					ch <- fileProgressMsg{err: err}
+					return
+				}
+				sent += int64(n)
+				ch <- fileProgressMsg{transferred: sent, total: total, isSending: true, done: sent >= total}
+			}
+			if readErr != nil {
+				if readErr == io.EOF {
+					if sent < total {
+						ch <- fileProgressMsg{transferred: total, total: total, isSending: true, done: true}
+					}
+				} else {
+					ch <- fileProgressMsg{err: readErr}
+				}
+				break
+			}
+		}
+	}()
+	return waitForProgressMsg(ch)
+}
+
+func waitForProgressMsg(ch chan fileProgressMsg) tea.Cmd {
+	return func() tea.Msg {
+		return <-ch
+	}
+}
+
 func startReader(conn net.Conn, aead cipher.AEAD) chatStream {
 	ch := make(chan chatMsg)
 	go func() {
@@ -855,7 +1187,32 @@ func startReader(conn net.Conn, aead cipher.AEAD) chatStream {
 				ch <- chatMsg{content: "[Decryption failed — tampering detected?]", system: true}
 				continue
 			}
-			ch <- chatMsg{content: string(plaintext), system: false}
+			if len(plaintext) == 0 {
+				continue
+			}
+
+			msgType := plaintext[0]
+			payload := plaintext[1:]
+
+			switch msgType {
+			case MsgTypeChat:
+				ch <- chatMsg{content: string(payload), system: false}
+
+			case MsgTypeFileOffer:
+				var offer FileOfferPayload
+				if err := json.Unmarshal(payload, &offer); err == nil {
+					ch <- chatMsg{fileOffer: &offer}
+				}
+
+			case MsgTypeFileResponse:
+				if len(payload) > 0 {
+					accepted := payload[0] == 0x01
+					ch <- chatMsg{fileResponse: &accepted}
+				}
+
+			case MsgTypeFileChunk:
+				ch <- chatMsg{fileChunk: payload}
+			}
 		}
 	}()
 	return chatStream{ch: ch}
@@ -875,6 +1232,25 @@ func main() {
 	listenFlag := flag.Bool("listen", false, "Listen for incoming connections")
 	connectFlag := flag.String("connect", "", "Connect to a peer's onion address")
 	burnerMode := flag.Bool("burner-mode", false, "Run in burner mode (random temporary identity)")
+
+	flag.Usage = func() {
+		banner := titleStyle.Render(" Veil — Ephemeral Encrypted P2P Messenger ")
+		fmt.Printf("\n%s\n\n", banner)
+		fmt.Println(promptStyle.Render("USAGE:"))
+		fmt.Println("  veil [FLAGS]\n")
+		fmt.Println(promptStyle.Render("FLAGS:"))
+		fmt.Println("  --listen               Start Veil in host/listener mode")
+		fmt.Println("  --connect <address>    Connect directly to a peer's .onion address")
+		fmt.Println("  --burner-mode          Run with a throwaway keypair (no disk persistence)")
+		fmt.Println("  --help, -h             Show this help menu\n")
+		fmt.Println(infoStyle.Render("IN-CHAT COMMANDS:"))
+		fmt.Println("  /add <name>            Save current peer to contacts")
+		fmt.Println("  /remove <name>         Remove a contact by nickname")
+		fmt.Println("  /send <path>           Transfer a file to the active peer")
+		fmt.Println("  /accept                Accept an incoming file transfer")
+		fmt.Println("  /reject                Reject an incoming file transfer\n")
+	}
+
 	flag.Parse()
 
 	// Load contacts from disk (non-fatal if missing)

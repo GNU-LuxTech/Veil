@@ -206,12 +206,12 @@ and **intellectual property protection** (required for sustainability).
 
 ### Phase 3 — Features
 
-- [ ] `/send` file transfer over active session
+- [x] `/send` file transfer over active session
 - [x] Contact alias system (local nickname → onion address mapping)
 - [ ] `--auto-accept` whitelist for trusted addresses
 - [ ] Session transcript opt-in (encrypted, local only)
 - [ ] Multi-platform builds (Linux, macOS, Windows, Android via Termux)
-- [ ] `--help` flag with styled usage output
+- [x] `--help` flag with styled usage output
 
 ### Phase 4 — Hardening
 
