@@ -612,6 +612,20 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 				// ── Slash commands ─────────────────────────────────────────────
+				if content == "/help" {
+					helpText := "Available Chat Commands:\n" +
+						"  /help          Show this help message\n" +
+						"  /add <name>    Save current peer to contacts\n" +
+						"  /remove <name> Remove a contact by nickname\n" +
+						"  /send <path>   Transfer a file to active peer\n" +
+						"  /accept        Accept an incoming file offer\n" +
+						"  /reject        Reject an incoming file offer"
+					m.appendSystem(helpText)
+					m.viewport.SetContent(strings.Join(m.messages, "\n"))
+					m.viewport.GotoBottom()
+					return m, tea.Batch(tiCmd, vpCmd)
+				}
+
 				if strings.HasPrefix(content, "/add ") {
 					nickname := strings.TrimSpace(strings.TrimPrefix(content, "/add "))
 					if nickname == "" {
@@ -1281,6 +1295,7 @@ func main() {
 		fmt.Println("  --auto-accept          Auto-accept connections & files from contacts")
 		fmt.Println("  --help, -h             Show this help menu\n")
 		fmt.Println(infoStyle.Render("IN-CHAT COMMANDS:"))
+		fmt.Println("  /help                  Show in-session help menu")
 		fmt.Println("  /add <name>            Save current peer to contacts")
 		fmt.Println("  /remove <name>         Remove a contact by nickname")
 		fmt.Println("  /send <path>           Transfer a file to the active peer")
