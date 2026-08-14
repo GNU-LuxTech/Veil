@@ -209,7 +209,6 @@ and **intellectual property protection** (required for sustainability).
 - [x] `/send` file transfer over active session
 - [x] Contact alias system (local nickname → onion address mapping)
 - [ ] `--auto-accept` whitelist for trusted addresses
-- [ ] Session transcript opt-in (encrypted, local only)
 - [x] `--help` flag with styled usage output
 
 ### Phase 4 — Hardening
